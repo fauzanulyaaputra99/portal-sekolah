@@ -12,9 +12,19 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
+        // Alias `role` untuk penegakan otorisasi server-side per grup rute
+        // (PRD 02 §6 butir 3, PRD 04 §3.2.1). Melanggar prefix role => 403.
         $middleware->alias([
-            'active' => \App\Http\Middleware\EnsureUserIsActive::class,
+            'role' => \App\Http\Middleware\EnsureUserHasRole::class,
         ]);
+
+        // PRD 04 §3.1.4: verifikasi akun aktif bersifat GLOBAL untuk seluruh
+        // rute web — sesi diputasi seketika bila users.is_active = FALSE.
+        //
+        // Registrasi ganda yang ditemukan saat audit (dulu: global web append
+        // DAN alias 'active' dipakai ulang pada grup route terproteksi) sudah
+        // dibersihkan: rute tidak lagi menyematkan 'active' secara manual,
+        // sehingga middleware dieksekusi tepat satu kali per request.
         $middleware->web(append: [
             \App\Http\Middleware\EnsureUserIsActive::class,
         ]);
