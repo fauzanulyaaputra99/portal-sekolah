@@ -15,6 +15,7 @@ class Student extends Model
         'user_id',
         'nis',
         'nisn',
+        'barcode_code',
         'full_name',
         'gender',
         'birth_date',
@@ -40,5 +41,14 @@ class Student extends Model
     public function attendanceRecords(): HasMany
     {
         return $this->hasMany(StudentAttendanceRecord::class, 'student_id');
+    }
+
+    /**
+     * Absensi Masuk/Pulang SEKOLAH (PRD 02 §10.15).
+     * Satu siswa maksimal satu record per tanggal (uq_student_school_att_entry).
+     */
+    public function schoolAttendances(): HasMany
+    {
+        return $this->hasMany(SchoolAttendance::class, 'student_id');
     }
 }

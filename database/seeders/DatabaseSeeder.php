@@ -22,15 +22,9 @@ class DatabaseSeeder extends Seeder
      */
     public function run(): void
     {
-        // 1. Initial Settings (ADR 02: Dynamic teacher attendance cutoff)
-        Setting::updateOrCreate(
-            ['key' => 'teacher_attendance_late_cutoff'],
-            [
-                'value' => '07:15:00',
-                'description' => 'Batas jam toleransi check-in guru sebelum dianggap terlambat (WIB)',
-            ]
-        );
-
+        // 1. Initial Settings (profil sekolah)
+        // Catatan: key 'teacher_attendance_late_cutoff' sudah DIHAPUS dari
+        // seeder karena fitur absensi mandiri guru obsolete (ADR 01/02/03).
         Setting::updateOrCreate(
             ['key' => 'school_name'],
             [
@@ -135,12 +129,17 @@ class DatabaseSeeder extends Seeder
         );
 
         // 9. Baseline Sample Students (27 siswa dummy untuk development)
+        // barcode_code diisi deterministik dari NIS (kartu demo memakai nilai
+        // yang sama dengan NIS). PRD belum menetapkan format kartu fisik,
+        // karena itu TIDAK ada format/angka acak baru yang dikarang di sini;
+        // barcode kartu sebenarnya diisi/diubah oleh Admin/TU lewat master data.
         for ($i = 1; $i <= 27; $i++) {
             $nis = sprintf('262707%02d', $i);
             $student = Student::updateOrCreate(
                 ['nis' => $nis],
                 [
                     'nisn' => '0098' . sprintf('%06d', $i),
+                    'barcode_code' => $nis,
                     'full_name' => 'Siswa Contoh ' . $i . ' (Dev Data)',
                     'gender' => ($i % 2 === 0) ? 'P' : 'L',
                     'birth_date' => '2013-05-10',
