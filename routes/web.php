@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Admin\TeacherDutyScheduleController;
 use App\Http\Controllers\Auth\LoginController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\RoleDashboardController;
@@ -23,8 +24,12 @@ use Illuminate\Support\Facades\Route;
 |    kontrol akses; akses URL langsung tetap terproteksi.
 |
 | CATATAN: rute scanner absensi masuk/pulang (/guru/school-attendance-scanner)
-| BELUM dibuat pada tahap ini — dibangun pada tahap adjustment fitur
-| berikutnya bersama DutySchedulePolicy (teacher_duty_schedules).
+| BELUM dibuat pada tahap ini. Yang sudah aktif adalah pengelolaan jadwalnya
+| (/admin/duty-schedules + TeacherDutySchedulePolicy). Validasi jadwal piket
+| per request untuk scanner dibangun bersama fitur scanner itu sendiri.
+|
+| Sumber kebenaran "Guru Piket" tetap tabel teacher_duty_schedules pada tanggal
+| berjalan server (Asia/Jakarta) — BUKAN role baru, BUKAN users.is_piket.
 */
 
 // Root URL: arahkan ke dashboard jika terautentikasi, atau login jika tamu
@@ -59,6 +64,13 @@ Route::middleware(['auth', 'role:admin'])
     ->name('admin.')
     ->group(function () {
         Route::get('/dashboard', [RoleDashboardController::class, 'admin'])->name('dashboard');
+
+        // CRUD Jadwal Guru Piket (PRD 02 §6 /admin/duty-schedules, ADM-PIK-001).
+        // 6 aksi: index/create/store/edit/update/destroy. `show` sengaja
+        // dikecualikan karena PRD tidak mensyaratkan halaman detail jadwal.
+        Route::resource('duty-schedules', TeacherDutyScheduleController::class)
+            ->except(['show'])
+            ->parameters(['duty-schedules' => 'dutySchedule']);
     });
 
 // ---------------------------------------------------------------------------

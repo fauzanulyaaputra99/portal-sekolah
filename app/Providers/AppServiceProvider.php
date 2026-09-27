@@ -4,9 +4,11 @@ namespace App\Providers;
 
 use App\Models\Document;
 use App\Models\StudentAttendanceSession;
+use App\Models\TeacherDutySchedule;
 use App\Models\TeachingAssignment;
 use App\Policies\DocumentPolicy;
 use App\Policies\StudentAttendanceSessionPolicy;
+use App\Policies\TeacherDutySchedulePolicy;
 use App\Policies\TeachingAssignmentPolicy;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\ServiceProvider;
@@ -34,5 +36,6 @@ class AppServiceProvider extends ServiceProvider
         Gate::policy(Document::class, DocumentPolicy::class);
         Gate::policy(TeachingAssignment::class, TeachingAssignmentPolicy::class);
         Gate::policy(StudentAttendanceSession::class, StudentAttendanceSessionPolicy::class);
+        Gate::policy(TeacherDutySchedule::class, TeacherDutySchedulePolicy::class);
     }
 }

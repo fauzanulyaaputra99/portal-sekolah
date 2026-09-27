@@ -14,6 +14,18 @@ class AuditLog extends Model
     public const ACTION_LOGIN_FAILED = 'LOGIN_FAILED';
     public const ACTION_LOGOUT = 'LOGOUT';
 
+    /**
+     * Aksi CRUD Jadwal Guru Piket (ADDENDUM §17, PRD 01 §6.11 ADM-PIK-004,
+     * PRD 04 §9.1 baris "Jadwal Piket Guru").
+     *
+     * Status "Guru Piket" bukan role — seluruh perubahannya wajib teraudit.
+     */
+    public const ACTION_DUTY_SCHEDULE_CREATE = 'DUTY_SCHEDULE_CREATE';
+
+    public const ACTION_DUTY_SCHEDULE_UPDATE = 'DUTY_SCHEDULE_UPDATE';
+
+    public const ACTION_DUTY_SCHEDULE_DELETE = 'DUTY_SCHEDULE_DELETE';
+
     public $timestamps = false;
 
     protected $fillable = [

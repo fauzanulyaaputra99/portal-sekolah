@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\AuditLog;
 use App\Models\User;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\Request;
 
 class AuditService
@@ -68,6 +69,45 @@ class AuditService
             'new_values' => [
                 'username' => $user->username,
             ],
+            'ip_address' => $request->ip(),
+            'user_agent' => $request->userAgent(),
+            'created_at' => now(),
+        ]);
+    }
+
+    /**
+     * Catat perubahan DATA master/operasional ke audit log (PRD 04 §9.1,
+     * PRD 01 §6.10 ADM-LOG-001 — "perubahan jadwal piket" wajib dicatat).
+     *
+     * Struktur dibuat identik dengan audit login agar satu format untuk
+     * seluruh auditor. Hanya nilai non-sensitif yang boleh dikirim
+     * (PRD 04 §10.2): id, nama, tanggal, dan kode aksi.
+     *
+     * @param  array<string, mixed>|null  $oldValues
+     * @param  array<string, mixed>|null  $newValues
+     * @param  int|null  $auditableId  Id eksplisit, dipakai untuk aksi DELETE
+     *                                 saat model target sudah tidak tersedia.
+     */
+    public static function logDataChange(
+        User $actor,
+        string $action,
+        Model|string $target,
+        ?array $oldValues,
+        ?array $newValues,
+        Request $request,
+        ?int $auditableId = null,
+    ): AuditLog {
+        $targetType = $target instanceof Model ? $target::class : $target;
+        $targetId = $auditableId ?? ($target instanceof Model ? $target->getKey() : null);
+
+        return AuditLog::create([
+            'user_id' => $actor->id,
+            'role' => $actor->role,
+            'action' => $action,
+            'auditable_type' => $targetType,
+            'auditable_id' => $targetId,
+            'old_values' => $oldValues,
+            'new_values' => $newValues,
             'ip_address' => $request->ip(),
             'user_agent' => $request->userAgent(),
             'created_at' => now(),
