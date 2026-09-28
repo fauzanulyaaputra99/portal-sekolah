@@ -28,6 +28,15 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->web(append: [
             \App\Http\Middleware\EnsureUserIsActive::class,
         ]);
+
+        // PRD 04 §5.3 / OWASP A05: security headers GLOBAL (bukan per-rute),
+        // sehingga berlaku pada seluruh response aplikasi — area admin/guru/
+        // supervisor, halaman login, maupun response error.
+        // Diprepend agar header juga tertempel saat response dibungkus lebih
+        // awal, dan tetap terisi bila middleware dalam men-set header yang sama.
+        $middleware->prepend([
+            \App\Http\Middleware\SetSecurityHeaders::class,
+        ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         $exceptions->shouldRenderJsonWhen(

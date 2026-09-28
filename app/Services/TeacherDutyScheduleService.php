@@ -12,6 +12,7 @@ use DateTimeInterface;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\ValidationException;
 use Throwable;
 
@@ -369,12 +370,37 @@ class TeacherDutyScheduleService
         }
     }
 
+    /**
+     * Duplikat yang LOLOS pre-check dan baru tertahan oleh constraint UNIQUE
+     * (interleaving permintaan paralel) tetap dilaporkan sebagai pesan
+     * validasi yang manusiawi, BUKAN exception mentah.
+     *
+     * CATATAN API (pernah menjadi bug nyata): `Illuminate\Validation\
+     * ValidationException` TIDAK memiliki method `previous()` — pemanggilannya
+     * melempar `Error: Call to undefined method`, sehingga respons menjadi
+     * HTTP 500 dan pesan bisnis hilang. Chaining penyebab di PHP dilakukan
+     * lewat parameter $previous pada konstruktor `Exception`, yang TIDAK
+     * diekspos oleh ValidationException::__construct($validator, $response,
+     * $errorBag) maupun oleh withMessages().
+     *
+     * Solusi: cause (UniqueConstraintViolationException) dicatat ke log
+     * aplikasi agar kegagalan tidak diam-diam (PRD 04 §10 / OWASP A09),
+     * sementara yang dilempar ke caller tetap ValidationException murni.
+     * Payload log sengaja tidak memuat input mentah/nilai sensitif.
+     */
     private function duplicateException(Teacher $teacher, CarbonInterface $date, Throwable $e): ValidationException
     {
+        Log::warning('Duty schedule duplicate caught by database constraint', [
+            'reason' => 'unique_constraint_raced_past_precheck',
+            'teacher_id' => (int) $teacher->getKey(),
+            'schedule_date' => $date->toDateString(),
+            'cause' => $e::class,
+        ]);
+
         return ValidationException::withMessages([
             'teacher_id' => 'Guru ' . $teacher->full_name
                 . ' sudah memiliki jadwal piket pada tanggal ' . $date->toDateString()
                 . '. Perubahan tidak disimpan.',
-        ])->previous($e);
+        ]);
     }
 }

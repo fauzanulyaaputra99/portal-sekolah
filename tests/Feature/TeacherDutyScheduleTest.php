@@ -14,6 +14,7 @@ use Illuminate\Foundation\Http\Middleware\PreventRequestForgery;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Validation\ValidationException;
 use Tests\TestCase;
 
 /**
@@ -915,6 +916,71 @@ class TeacherDutyScheduleTest extends TestCase
             ->assertSee('&lt;script&gt;alert(1)&lt;/script&gt;', false);
     }
 
+    /**
+     * OWASP A03/A05 (XSS): payload yang SUDAH tersimpan di database harus
+     * ter-escape pada setiap tempat ia ditampilkan — halaman daftar (dibuka
+     * Admin maupun Supervisor read-only) dan halaman edit.
+     */
+    public function test_stored_xss_payload_is_escaped_everywhere_it_is_displayed(): void
+    {
+        $admin = $this->admin();
+        $xss = '<script>alert(1)</script>';
+        $escaped = '&lt;script&gt;alert(1)&lt;/script&gt;';
+
+        // Nama guru berasal dari master data (bukan input form jadwal) dan
+        // tetap dirender pada baris tabel -> ikut diuji.
+        $teacherUser = $this->makeUser(User::ROLE_TEACHER, 'guru_xss_stored');
+        $teacher = Teacher::create([
+            'user_id' => $teacherUser->id,
+            'nip' => '198500000000099',
+            'full_name' => 'Guru ' . $xss,
+            'gender' => 'L',
+        ]);
+
+        $schedule = $this->makeSchedule($teacher, '2026-09-28', $admin, 'Catatan ' . $xss);
+
+        // Nilai mentah memang tersimpan mentah di DB (pembelaan ada di OUTPUT,
+        // bukan dengan merusak data saat disimpan).
+        $this->assertSame('Catatan ' . $xss, $schedule->fresh()->notes);
+
+        $supervisor = $this->makeUser(User::ROLE_SUPERVISOR, 'supervisor_xss');
+
+        // Halaman daftar: dibuka oleh Admin (pengelola) dan Supervisor (read-only).
+        foreach ([$this->adminControl($admin), $supervisor] as $viewer) {
+            $this->actingAs($viewer)
+                ->get(route('admin.duty-schedules.index'))
+                ->assertOk()
+                ->assertDontSee($xss, false)
+                ->assertSee($escaped, false);
+        }
+
+        // Halaman edit (hanya Admin): value atribut juga harus ter-escape.
+        $this->actingAs($this->adminControl($admin))
+            ->get(route('admin.duty-schedules.edit', $schedule))
+            ->assertOk()
+            ->assertDontSee($xss, false)
+            ->assertSee($escaped, false);
+
+        // Tidak ada unescaped Blade output pada view jadwal piket ({!! ... !!}).
+        $viewDir = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator(base_path('resources/views/admin/duty-schedules'))
+        );
+
+        $checked = 0;
+        foreach ($viewDir as $file) {
+            if (! $file->isFile() || $file->getExtension() !== 'php') {
+                continue;
+            }
+            $this->assertStringNotContainsString(
+                '{!!',
+                file_get_contents($file->getPathname()),
+                'Dilarang memakai unescaped Blade echo: ' . $file->getFilename()
+            );
+            $checked++;
+        }
+        $this->assertGreaterThan(0, $checked);
+    }
+
     // =================================================================
     // 8. AUDIT  (ADM-PIK-004 / ADDENDUM §17 / PRD 04 §9.1)
     // =================================================================
@@ -1269,6 +1335,97 @@ class TeacherDutyScheduleTest extends TestCase
             'teacher_id' => $teacher->id,
             'created_by_user_id' => $admin->id,
         ]);
+    }
+
+    /**
+     * OWASP A04/A08 (race condition + transaction integrity): pre-check
+     * duplikasi di service bukan penjaga tunggal. Bila "permintaan lain"
+     * menyelipkan baris identik SETELAH pre-check lolos (interleaving
+     * sungguhan), maka:
+     *   1. constraint UNIQUE uq_duty_schedule_entry yang menang (fail closed),
+     *   2. seluruh transaksi di-rollback (tidak ada baris yatim),
+     *   3. audit TIDAK ditulis untuk mutasi yang gagal,
+     *   4. pengguna menerima pesan validasi, BUKAN exception mentah/stack trace.
+     *
+     * REGRESSION GUARD: assert (4) mengunci bug nyata yang ditemukan saat
+     * security probing dan sudah diperbaiki — service memanggil ->previous()
+     * pada ValidationException, padahal method itu TIDAK ADA di API Laravel
+     * (diverifikasi via refleksi: hasMethod('previous') false pada kelas maupun
+     * seluruh hierarchy). Akibat sebelumnya: jalur balapan melempar Error dan
+     * berujung HTTP 500, bukan pesan validasi.
+     */
+    public function test_concurrent_duplicate_is_caught_by_database_constraint_and_rolled_back(): void
+    {
+        $admin = $this->admin();
+        [, $teacher] = $this->makeTeacherUser('guru_balapan');
+        $date = '2026-11-05';
+        $service = app(TeacherDutyScheduleService::class);
+
+        // Hook ini meniru permintaan paralel: berjalan tepat saat INSERT model
+        // akan dieksekusi (yaitu SETELAH ensureNotDuplicate() lolos), jadi
+        // pre-check tidak mungkin melihat baris pesaingnya.
+        $events = app('events');
+        $ranOnce = false;
+
+        $events->listen('eloquent.creating: ' . TeacherDutySchedule::class, function () use ($teacher, $date, $admin, &$ranOnce): void {
+            if ($ranOnce) {
+                return;
+            }
+            $ranOnce = true;
+
+            DB::table('teacher_duty_schedules')->insert([
+                'schedule_date' => $date,
+                'teacher_id' => $teacher->id,
+                'created_by_user_id' => $admin->id,
+            ]);
+        });
+
+        $thrown = null;
+
+        try {
+            $service->create(
+                ['teacher_id' => $teacher->id, 'schedule_date' => $date, 'notes' => 'piket pagi'],
+                $admin,
+                \Illuminate\Http\Request::create(route('admin.duty-schedules.store'), 'POST'),
+            );
+        } catch (\Throwable $e) {
+            $thrown = $e;
+        } finally {
+            $events->forget('eloquent.creating: ' . TeacherDutySchedule::class);
+        }
+
+        $this->assertTrue($ranOnce, 'Skenario balapan harus benar-benar terpicu.');
+        $this->assertNotNull($thrown, 'Duplikat hasil balapan WAJIB ditolak (fail closed).');
+
+        // JAMINAN KEAMANAN 2: transaksi atomik — baris "pesaing" ikut
+        // ter-rollback karena diselipkan di dalam transaksi service yang sama.
+        $this->assertSame(0, TeacherDutySchedule::count(), 'Rollback harus membatalkan seluruh baris.');
+
+        // JAMINAN KEAMANAN 3: tidak ada jejak audit untuk mutasi yang gagal.
+        $this->assertSame(
+            0,
+            AuditLog::where('action', AuditLog::ACTION_DUTY_SCHEDULE_CREATE)->count(),
+            'Mutasi gagal tidak boleh tercatat sebagai sukses di audit.'
+        );
+
+        // JAMINAN KEAMANAN 1: constraint UNIQUE tetap menjadi penjaga terakhir
+        // (ditolak, bukan diam-diam lolos).
+        $this->assertNotEmpty(
+            collect(DB::select('SHOW INDEX FROM teacher_duty_schedules'))
+                ->where('Key_name', 'uq_duty_schedule_entry')
+                ->all()
+        );
+
+        // PERILAKU ERROR (defect terkenal): harus pesan validasi, bukan mentah.
+        $this->assertInstanceOf(
+            ValidationException::class,
+            $thrown,
+            'Duplikat hasil balapan harus menjadi pesan validasi, BUKAN exception mentah. '
+                . 'Dapat: ' . get_class($thrown) . ' - ' . $thrown->getMessage()
+        );
+        // `errors()` mengembalikan ARRAY pesan (bukan MessageBag) -> tidak ada ->toArray().
+        $this->assertArrayHasKey('teacher_id', $thrown->errors());
+        $this->assertStringContainsString('sudah memiliki jadwal piket', $thrown->getMessage());
     }
 
     // =================================================================
