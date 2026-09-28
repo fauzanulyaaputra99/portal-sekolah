@@ -78,6 +78,15 @@ class TeacherDutyScheduleTest extends TestCase
         return $this->makeUser(User::ROLE_ADMIN, 'admin_tu_duty');
     }
 
+    /**
+     * Helper test baca-saja: `admin()` tidak boleh dipanggil dua kali pada test
+     * yang sama (username unik), jadi akun yang sama disegarkan ulang.
+     */
+    private function adminControl(User $admin): User
+    {
+        return $admin->fresh();
+    }
+
     private function makeStudent(string $nis): Student
     {
         return Student::create([
@@ -544,6 +553,9 @@ class TeacherDutyScheduleTest extends TestCase
 
         $otherGuru = $this->makeTeacherUser('guru_lain')[0];
 
+        // PRD 01 §5.4: Guru = "Tidak Ada" pada Kelola Jadwal Piket, sehingga
+        // guru ditolak 403 pada SEMUA endpoint (baca maupun mutasi), termasuk
+        // halaman daftar jadwal.
         $endpoints = [
             ['get', route('admin.duty-schedules.index')],
             ['get', route('admin.duty-schedules.create')],
@@ -557,19 +569,74 @@ class TeacherDutyScheduleTest extends TestCase
             $this->actingAs($otherGuru)->{$verb}($url)->assertForbidden();
         }
 
-        $this->actingAs($guruOwner)->get(route('admin.duty-schedules.index'))->assertForbidden();
+        // Bahkan untuk jadwal miliknya sendiri, guru tidak boleh masuk ke area
+        // pengelolaan Admin (banner status piket memakai route /guru, bukan ini).
+        $this->actingAs($guruOwner->fresh())->get(route('admin.duty-schedules.index'))->assertForbidden();
+        $this->assertFalse($guruOwner->fresh()->can('viewAny', TeacherDutySchedule::class));
         $this->assertSame(1, TeacherDutySchedule::count(), 'Tidak ada mutasi oleh guru.');
     }
 
-    public function test_supervisor_is_forbidden_on_every_duty_schedule_endpoint(): void
+    public function test_supervisor_can_read_duty_schedule_index(): void
+    {
+        $admin = $this->admin();
+        [, $teacher] = $this->makeTeacherUser('guru_dibaca_supervisor');
+        $schedule = $this->makeSchedule($teacher, '2026-09-28', $admin, 'CATATAN-BACA-SUPERVISOR');
+        $scheduleId = (int) $schedule->id;
+        $supervisor = $this->makeUser(User::ROLE_SUPERVISOR, 'supervisor_baca');
+
+        // PRD 01 §5.4 Supervisor = READ-ONLY -> daftar jadwal boleh dibaca.
+        $this->assertTrue($supervisor->can('viewAny', TeacherDutySchedule::class));
+
+        $this->actingAs($supervisor)->get(route('admin.duty-schedules.index'))
+            ->assertOk()
+            ->assertSee('Jadwal Guru Piket')
+            ->assertSee('CATATAN-BACA-SUPERVISOR');
+
+        // Tombol/aksi mutasi tidak dirender untuk supervisor (kenyamanan UI saja;
+        // keamanan sesungguhnya tetap middleware + policy). Admin sebagai kontrol:
+        // tombol dan URL aksi muncul penuh.
+        $editUrl = route('admin.duty-schedules.edit', $scheduleId);
+        $destroyUrl = route('admin.duty-schedules.destroy', $scheduleId);
+
+        $this->actingAs($this->adminControl($admin))->get(route('admin.duty-schedules.index'))
+            ->assertOk()
+            ->assertSee('Tambah Jadwal')
+            ->assertSee($editUrl, false)
+            ->assertSee($destroyUrl, false);
+
+        $this->actingAs($supervisor)->get(route('admin.duty-schedules.index'))
+            ->assertOk()
+            ->assertDontSee('Tambah Jadwal')
+            ->assertDontSee($editUrl, false)
+            ->assertDontSee($destroyUrl, false);
+
+        // Navigasi (BUKAN kontrol keamanan): tautan "Dashboard" pada layout
+        // area admin bersifat role-aware, sehingga Supervisor yang membaca
+        // jadwal read-only tidak diarahkan ke /admin/dashboard (403 untuknya).
+        $supervisorDashboard = route('supervisor.dashboard');
+        $adminDashboard = route('admin.dashboard');
+
+        $this->actingAs($supervisor)->get(route('admin.duty-schedules.index'))
+            ->assertOk()
+            ->assertSee('href="' . $supervisorDashboard . '"', false)
+            ->assertDontSee('href="' . $adminDashboard . '"', false);
+
+        // Admin/TU tetap mendapat tautan dashboard admin seperti semula.
+        $this->actingAs($this->adminControl($admin))->get(route('admin.duty-schedules.index'))
+            ->assertOk()
+            ->assertSee('href="' . $adminDashboard . '"', false);
+    }
+
+    public function test_supervisor_is_forbidden_on_duty_schedule_mutation_endpoints(): void
     {
         $admin = $this->admin();
         [, $teacher] = $this->makeTeacherUser('guru_dijaga');
         $schedule = $this->makeSchedule($teacher, '2026-09-28', $admin);
         $supervisor = $this->makeUser(User::ROLE_SUPERVISOR, 'supervisor_duty');
 
+        // HANYA aksi mutasi yang ditolak untuk supervisor. Aksi baca (index)
+        // diuji pada test_supervisor_can_read_duty_schedule_index.
         foreach ([
-            ['get', route('admin.duty-schedules.index')],
             ['get', route('admin.duty-schedules.create')],
             ['post', route('admin.duty-schedules.store')],
             ['get', route('admin.duty-schedules.edit', $schedule)],
@@ -581,10 +648,12 @@ class TeacherDutyScheduleTest extends TestCase
 
         // Supervisor READ-ONLY (PRD 01 §5.4) -> tidak punya hak mutasi.
         $this->assertTrue($supervisor->can('viewAny', TeacherDutySchedule::class));
+        $this->assertTrue($supervisor->can('view', $schedule));
         $this->assertFalse($supervisor->can('create', TeacherDutySchedule::class));
         $this->assertFalse($supervisor->can('update', $schedule));
         $this->assertFalse($supervisor->can('delete', $schedule));
         $this->assertSame(1, TeacherDutySchedule::count());
+        $this->assertSame('2026-09-28', $schedule->fresh()->schedule_date->toDateString());
     }
 
     public function test_guest_is_redirected_to_login_on_duty_schedule_routes(): void
@@ -610,7 +679,96 @@ class TeacherDutyScheduleTest extends TestCase
             ->assertForbidden();
 
         $this->assertSame('2026-09-28', $schedule->fresh()->schedule_date->toDateString());
+
+        // Hak BACA tidak boleh melebar menjadi hak MUTASI lewat URL langsung.
+        $this->actingAs($supervisor)
+            ->withHeaders(['X-Role' => 'admin'])
+            ->get(route('admin.duty-schedules.create') . '?role=admin')
+            ->assertForbidden();
+
+        $this->actingAs($supervisor)
+            ->withHeaders(['X-Role' => 'admin'])
+            ->get(route('admin.duty-schedules.edit', $schedule) . '?role=admin')
+            ->assertForbidden();
+
+        $this->actingAs($supervisor)
+            ->withHeaders(['X-Role' => 'admin'])
+            ->delete(route('admin.duty-schedules.destroy', $schedule) . '?role=admin')
+            ->assertForbidden();
+
+        $this->assertSame(1, TeacherDutySchedule::count(), 'URL langsung tidak boleh memutasi data.');
+        $this->assertSame('2026-09-28', $schedule->fresh()->schedule_date->toDateString());
         unset($admin);
+    }
+
+    public function test_duty_schedule_index_is_admin_plus_supervisor_and_mutations_are_admin_only(): void
+    {
+        $router = app('router');
+
+        // Definisi group `web` baru tergabung ke Router setelah request pertama
+        // melewati HTTP Kernel, sehingga pipeline yang diperiksa adalah pipeline
+        // yang benar-benar dieksekusi.
+        $this->get('/login')->assertOk();
+
+        $find = fn (string $verb, string $uri) => collect(Route::getRoutes()->getRoutes())
+            ->first(fn ($r) => $r->uri() === $uri && in_array($verb, $r->methods(), true));
+
+        $role = \App\Http\Middleware\EnsureUserHasRole::class;
+
+        // 1. RUTE BACA: admin + supervisor (PRD 01 §5.4 Supervisor Read-only).
+        $index = $find('GET', 'admin/duty-schedules');
+        $this->assertNotNull($index, 'Rute GET admin/duty-schedules harus terdaftar.');
+
+        $indexMiddleware = $router->gatherRouteMiddleware($index);
+        $this->assertContains($role . ':admin,supervisor', $indexMiddleware);
+        $this->assertContains(\Illuminate\Auth\Middleware\Authenticate::class, $indexMiddleware);
+
+        // 2. RUTE MUTASI: tetap admin-only dan tidak memuat role supervisor.
+        $mutations = [
+            ['GET', 'admin/duty-schedules/create'],
+            ['POST', 'admin/duty-schedules'],
+            ['GET', 'admin/duty-schedules/{dutySchedule}/edit'],
+            ['PUT', 'admin/duty-schedules/{dutySchedule}'],
+            ['PATCH', 'admin/duty-schedules/{dutySchedule}'],
+            ['DELETE', 'admin/duty-schedules/{dutySchedule}'],
+        ];
+
+        foreach ($mutations as [$verb, $uri]) {
+            $route = $find($verb, $uri);
+            $this->assertNotNull($route, "Rute {$verb} {$uri} harus terdaftar.");
+
+            $resolved = $router->gatherRouteMiddleware($route);
+            $this->assertContains($role . ':admin', $resolved, "{$verb} {$uri} wajib role:admin.");
+            $this->assertStringNotContainsString(
+                'supervisor',
+                implode(',', array_filter($resolved, 'is_string')),
+                "{$verb} {$uri} tidak boleh memberi akses supervisor."
+            );
+        }
+
+        // 3. Tidak boleh ada rute duty-schedules di luar prefix /admin
+        //    (mis. /guru/duty-schedules atau /supervisor/duty-schedules).
+        $uris = collect(Route::getRoutes()->getRoutes())
+            ->map(fn ($r) => $r->uri())
+            ->filter(fn ($uri) => str_contains($uri, 'duty-schedules'))
+            ->unique()
+            ->sort()
+            ->values()
+            ->all();
+
+        $this->assertNotEmpty($uris);
+        foreach ($uris as $uri) {
+            $this->assertStringStartsWith('admin/', $uri, "Rute jadwal piket harus di bawah /admin: {$uri}");
+        }
+
+        // 4 URI unik: index, create, {dutySchedule} (PUT/PATCH/DELETE),
+        // dan {dutySchedule}/edit. Tidak ada rute guru/supervisor terpisah.
+        $this->assertSame([
+            'admin/duty-schedules',
+            'admin/duty-schedules/create',
+            'admin/duty-schedules/{dutySchedule}',
+            'admin/duty-schedules/{dutySchedule}/edit',
+        ], $uris);
     }
 
     public function test_only_admin_has_duty_schedule_management_capability(): void
@@ -1067,6 +1225,9 @@ class TeacherDutyScheduleTest extends TestCase
 
         $this->assertNotEmpty($uris, 'Rute duty-schedules harus terdaftar.');
         foreach ($uris as $uri) {
+            // Area pengelolaan jadwal tetap di bawah /admin. Supervisor diberi
+            // hak BACA pada URL yang sama (PRD 01 §5.4), BUKAN dibuatkan area
+            // /supervisor/duty-schedules baru.
             $this->assertStringStartsWith('admin/', $uri, "Rute jadwal piket harus di bawah /admin: {$uri}");
         }
 

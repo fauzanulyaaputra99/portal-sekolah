@@ -24,8 +24,21 @@
                     <h1 class="text-base font-bold text-slate-900 leading-tight">Portal Sekolah — Admin/TU</h1>
                     <p class="text-xs text-slate-500">@yield('subtitle', 'Area Administrasi')</p>
                 </div>
+                @php
+                    //Navigasi saja, BUKAN kontrol keamanan. Halaman ini bisa dibaca
+                    //oleh Admin/TU (pengelola) dan Supervisor (read-only, PRD 01 §5.4)
+                    //sehingga tautan Dashboard diarahkan ke dashboard milik role tsb.
+                    //Otorisasi tetap ditegakkan server-side oleh middleware `role`
+                    //dan Gate/Policy di controller.
+                    $navUser = auth()->user();
+                    $dashboardRoute = match (true) {
+                        $navUser?->isSupervisor() => 'supervisor.dashboard',
+                        $navUser?->isAdmin() => 'admin.dashboard',
+                        default => 'dashboard',
+                    };
+                @endphp
                 <div class="flex items-center gap-3">
-                    <a href="{{ route('admin.dashboard') }}"
+                    <a href="{{ route($dashboardRoute) }}"
                        class="text-xs font-semibold text-slate-600 hover:text-slate-900">Dashboard</a>
                     <span class="text-xs font-semibold text-slate-600">{{ auth()->user()->username }}</span>
                     <form method="POST" action="{{ route('logout') }}">

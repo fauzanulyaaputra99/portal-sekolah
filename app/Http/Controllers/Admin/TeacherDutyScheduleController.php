@@ -16,17 +16,31 @@ use Illuminate\View\View;
  * CRUD Jadwal Guru Piket untuk area Admin/TU (PRD 02 §6 rute
  * /admin/duty-schedules, PRD 01 §6.11 ADM-PIK-001/002, ADDENDUM §9).
  *
+ * Pembagian hak akses (PRD 01 §5.4):
+ * - Admin/TU : CRUD penuh (index, create, store, edit, update, destroy).
+ * - Supervisor: READ-ONLY — hanya index (melihat daftar jadwal), tanpa hak
+ *   membuat/mengubah/menghapus jadwal.
+ * - Guru      : TIDAK ada akses pengelolaan jadwal pada controller ini.
+ *
  * Pembagian tanggung jawab:
  * - Controller: validasi request, otorisasi Gate/Policy, panggil service,
  *   redirect + pesan UI. TIDAK ada business logic transaksi di sini.
  * - Service: transaksi database, validasi otoritatif guru, audit trail.
  *
  * Lapisan keamanan (PRD 04 §3.2):
- * 1. Middleware group `auth` + `role:admin` (routes/web.php) — menolak
- *    guru/supervisor pada SEMUA rute ini dengan HTTP 403, termasuk akses URL
- *    langsung. Blade/menu bukan kontrol keamanan.
- * 2. Gate/policy per objek pada create/edit/update/destroy — anti-IDOR;
- *    objek dimuat lewat route model binding dari database, bukan dari klien.
+ * 1. Middleware `auth` + `role` pada routes/web.php (kontrol akses utama,
+ *    ditegakkan server-side — Blade/menu BUKAN kontrol keamanan):
+ *      - GET /admin/duty-schedules (index): role:admin,supervisor.
+ *        Supervisor diberi hak BACA saja sesuai matriks PRD 01 §5.4
+ *        (Admin CRUD penuh / Guru Tidak Ada / Supervisor Read-only).
+ *      - create/store/edit/update/destroy: role:admin (ADMIN/TU ONLY).
+ *    Pelanggaran role => HTTP 403, termasuk akses URL langsung;
+ *    header/field/query `role` dari klien selalu diabaikan karena role
+ *    dibaca dari kolom users.role pada sesi server-side.
+ * 2. Gate/policy per aksi (TeacherDutySchedulePolicy) sebagai lapisan kedua:
+ *    index => viewAny (admin + supervisor), create/store => create,
+ *    edit/update => update, destroy => delete. Aksi mutasi ditolak untuk
+ *    supervisor maupun guru, termasuk saat middleware dilonggarkan.
  * 3. CSRF oleh middleware `web` + @csrf pada seluruh form.
  *
  * TIDAK ADA: role "piket", users.is_piket, nama guru hardcoded, nama hari
@@ -43,6 +57,10 @@ class TeacherDutyScheduleController extends Controller
 
     /**
      * Daftar jadwal piket (index) + penanda "tanggal berjalan" server.
+     *
+     * Aksi BACA: dapat diakses Admin/TU (pengelola) dan Supervisor
+     * (read-only, PRD 01 §5.4). Guru tetap ditolak — lihat
+     * TeacherDutySchedulePolicy::viewAny() dan middleware role rute ini.
      */
     public function index(Request $request): View
     {
