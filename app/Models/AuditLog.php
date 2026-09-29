@@ -26,6 +26,20 @@ class AuditLog extends Model
 
     public const ACTION_DUTY_SCHEDULE_DELETE = 'DUTY_SCHEDULE_DELETE';
 
+    /**
+     * Aksi modul Absensi Masuk/Pulang SEKOLAH (PRD 04 §9.1 baris
+     * "Absensi Masuk/Pulang Siswa", PRD 02 §4b butir 8, PRD 05 §22).
+     *
+     * SCHOOL_ATT_SCAN  : scan barcode siswa (MASUK atau PULANG) oleh Guru Piket.
+     * SCHOOL_ATT_CORRECT: koreksi record oleh Admin/TU — WAJIB disertai alasan
+     *                    (minimal 10 karakter) dan nilai lama/baru terimpan
+     *                    lengkap agar histori scan tetap dapat ditelusuri
+     *                    (PRD 01 §13.7).
+     */
+    public const ACTION_SCHOOL_ATT_SCAN = 'SCHOOL_ATT_SCAN';
+
+    public const ACTION_SCHOOL_ATT_CORRECT = 'SCHOOL_ATT_CORRECT';
+
     public $timestamps = false;
 
     protected $fillable = [

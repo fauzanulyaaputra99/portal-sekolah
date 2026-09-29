@@ -16,5 +16,8 @@
     "optionalDependencies": {
         "@laravel/multiplex": "^0.4.1",
         "@rolldown/binding-win32-x64-msvc": "^1.2.9"
+    },
+    "dependencies": {
+        "html5-qrcode": "^2.3.8"
     }
 }

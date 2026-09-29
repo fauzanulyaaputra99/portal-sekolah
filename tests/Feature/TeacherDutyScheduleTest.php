@@ -30,8 +30,9 @@ use Tests\TestCase;
  *   hardcode), §12 (revalidasi per request), §15-§16 (histori terkunci),
  *   §17 (audit), §22, §24 (tanpa WebSocket/Queue)
  *
- * TIDAK ada test scanner/browser: fitur scanner dibangun pada tahap
- * adjustment berikutnya (PRD 01 §7.4).
+ * Test scanner/browser dibangun pada tahap berikutnya (Adjustment D, PRD 01
+ * §7.4) dan berada pada SchoolAttendanceScanTest; kelas ini tetap menguji
+ * jadwal piket + bahwa perubahan jadwal tidak menyentuh histori absensi.
  */
 class TeacherDutyScheduleTest extends TestCase
 {
@@ -1297,11 +1298,22 @@ class TeacherDutyScheduleTest extends TestCase
             $this->assertStringStartsWith('admin/', $uri, "Rute jadwal piket harus di bawah /admin: {$uri}");
         }
 
-        // PRD: scanner bukan bagian tahap ini.
-        $this->assertFalse(Route::has('guru.school-attendance-scanner'));
-        foreach (Route::getRoutes() as $route) {
-            $this->assertStringNotContainsString('scanner', $route->uri());
-            $this->assertStringNotContainsString('barcode', $route->uri());
+        // ADJUSTMENT D: halaman scanner sudah dibangun, dan tempatnya BUKAN di
+        // area administrasi. Yang dijaga di sini:
+        //  1) rute scanner berada di bawah prefix /guru (bukan /admin), dan
+        //  2) dilindungi middleware on.duty (otoritas berbasis jadwal, bukan role).
+        $this->assertTrue(Route::has('guru.school-attendance-scanner.index'));
+        $this->assertTrue(Route::has('guru.school-attendance-scanner.store'));
+
+        $scannerRoutes = collect(Route::getRoutes()->getRoutes())
+            ->filter(fn ($r) => str_contains($r->uri(), 'school-attendance-scanner'))
+            ->values();
+
+        $this->assertNotEmpty($scannerRoutes, 'Rute scanner harus terdaftar.');
+
+        foreach ($scannerRoutes as $route) {
+            $this->assertStringStartsWith('guru/', $route->uri(), "Scanner bukan area admin: {$route->uri()}");
+            $this->assertContains('on.duty', $route->gatherMiddleware(), "Rute scanner wajib on.duty: {$route->uri()}");
         }
     }
 

@@ -16,6 +16,11 @@ return Application::configure(basePath: dirname(__DIR__))
         // (PRD 02 §6 butir 3, PRD 04 §3.2.1). Melanggar prefix role => 403.
         $middleware->alias([
             'role' => \App\Http\Middleware\EnsureUserHasRole::class,
+
+            // PRD 04 §3.2.4 / ADDENDUM §11–§14: gerbang scanner berbasis DATA
+            // jadwal piket pada tanggal server, direvalidasi pada SETIAP request
+            // (GET halaman maupun POST scan). Bukan role baru dan bukan flag user.
+            'on.duty' => \App\Http\Middleware\EnsureTeacherOnDuty::class,
         ]);
 
         // PRD 04 §3.1.4: verifikasi akun aktif bersifat GLOBAL untuk seluruh

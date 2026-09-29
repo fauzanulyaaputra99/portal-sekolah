@@ -3,10 +3,12 @@
 namespace App\Providers;
 
 use App\Models\Document;
+use App\Models\SchoolAttendance;
 use App\Models\StudentAttendanceSession;
 use App\Models\TeacherDutySchedule;
 use App\Models\TeachingAssignment;
 use App\Policies\DocumentPolicy;
+use App\Policies\SchoolAttendancePolicy;
 use App\Policies\StudentAttendanceSessionPolicy;
 use App\Policies\TeacherDutySchedulePolicy;
 use App\Policies\TeachingAssignmentPolicy;
@@ -37,5 +39,6 @@ class AppServiceProvider extends ServiceProvider
         Gate::policy(TeachingAssignment::class, TeachingAssignmentPolicy::class);
         Gate::policy(StudentAttendanceSession::class, StudentAttendanceSessionPolicy::class);
         Gate::policy(TeacherDutySchedule::class, TeacherDutySchedulePolicy::class);
+        Gate::policy(SchoolAttendance::class, SchoolAttendancePolicy::class);
     }
 }
