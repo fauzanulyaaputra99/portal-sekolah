@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Exceptions\ScanRejectionException;
 use App\Models\AuditLog;
 use App\Models\SchoolAttendance;
 use App\Models\Student;
@@ -68,6 +69,35 @@ class SchoolAttendanceScanService
 
     /** Batas teknis panjang barcode hasil decode (kolom students.barcode_code = varchar 50). */
     public const MAX_BARCODE_LENGTH = 50;
+
+    /**
+     * Outcome SCHOOL_ATT_SCAN (PRD 04 §9.1: event-nya adalah "Guru Piket
+     * MELAKUKAN scan barcode siswa", jadi aksi scan dicatat lengkap dengan
+     * HASILNYA - sama seperti AUTH_LOGIN_SUCCESS / AUTH_LOGIN_FAILED yang sama
+     *-sama mencatat percobaan yang gagal).
+     *
+     * outcome selalu disertai attendance_changed agar mustahil membaca sebuah
+     * baris audit sebagai perubahan data kalau memang tidak ada perubahan.
+     */
+    public const OUTCOME_SCAN_SUCCESS = 'SCAN_SUCCESS';
+
+    public const OUTCOME_DUPLICATE_MASUK = 'DUPLICATE_MASUK';
+
+    public const OUTCOME_DUPLICATE_PULANG = 'DUPLICATE_PULANG';
+
+    public const OUTCOME_DUPLICATE_RACE = 'DUPLICATE_RACE_DATABASE_CONSTRAINT';
+
+    public const OUTCOME_BARCODE_NOT_FOUND = 'BARCODE_NOT_FOUND';
+
+    public const OUTCOME_STUDENT_NOT_ACTIVE = 'STUDENT_NOT_ACTIVE';
+
+    public const OUTCOME_PULANG_WITHOUT_MASUK = 'PULANG_WITHOUT_MASUK';
+
+    public const OUTCOME_MODE_INVALID = 'MODE_INVALID';
+
+    public const OUTCOME_BARCODE_EMPTY = 'BARCODE_EMPTY';
+
+    public const OUTCOME_BARCODE_TOO_LONG = 'BARCODE_TOO_LONG';
 
     /**
      * Penanda sesi: tanggal SERVER pada saat guru TERBUKTI diberi akses scanner.
@@ -243,33 +273,54 @@ class SchoolAttendanceScanService
     {
         // (1) Revalidasi otoritas pada SETIAP request scan (bukan hanya saat
         // halaman dibuka): status piket + profil guru, dibaca ulang dari DB.
+        //
+        // 403 di sini SENGAJA berada di luar blok try di bawah: permintaan yang
+        // ditolak SEBELUM event scan Guru Piket benar-benar terjadi tidak
+        // menghasilkan audit SCHOOL_ATT_SCAN apa pun (PRD 02 §4b butir 1
+        // "jangan simpan apa pun" + PRD 04 §9.1).
         $teacher = $this->authorizeOrDeny($request, $user);
 
-        // (2) Mode tervalidasi eksplisit; (3) siswa resolusi dari barcode.
-        $mode = $this->resolveMode($rawMode);
-        $barcode = $this->resolveBarcode($rawBarcode);
-
-        // Tanggal & waktu SELALU dari server. Klien tidak pernah ditanya, dan
-        // field tanggal/timestamp mana pun yang dikirimnya tidak dibaca.
-        $dateString = $this->duty->currentDutyDate();
-        $moment = now();
-
-        $student = $this->resolveStudent($barcode);
-
         try {
-            // (4) Satu transaksi untuk "ambil atau isi" record
-            // (student_id, attendance_date).
-            return DB::transaction(function () use ($request, $user, $teacher, $student, $mode, $dateString, $moment): SchoolAttendance {
-                $existing = $this->lockTodaysRecord((int) $student->getKey(), $dateString);
+            // (2) Mode tervalidasi eksplisit; (3) siswa resolusi dari barcode.
+            $mode = $this->resolveMode($rawMode);
+            $barcode = $this->resolveBarcode($rawBarcode);
 
-                return $mode === self::MODE_MASUK
-                    ? $this->recordCheckIn($existing, $student, $teacher, $user, $request, $dateString, $moment)
-                    : $this->recordCheckOut($existing, $student, $teacher, $user, $request, $dateString, $moment);
-            });
-        } catch (UniqueConstraintViolationException $e) {
-            // (7) Penjaga terakhir: dua request MASUK hampir bersamaan untuk
-            // siswa & tanggal sama -> hanya satu baris yang boleh ada.
-            throw $this->raceDuplicateException($student, $dateString, $e);
+            // Tanggal & waktu SELALU dari server. Klien tidak pernah ditanya, dan
+            // field tanggal/timestamp mana pun yang dikirimnya tidak dibaca.
+            $dateString = $this->duty->currentDutyDate();
+            $moment = now();
+
+            $student = $this->resolveStudent($barcode);
+
+            try {
+                // (4) Satu transaksi untuk "ambil atau isi" record
+                // (student_id, attendance_date).
+                return DB::transaction(function () use ($request, $user, $teacher, $student, $mode, $dateString, $moment): SchoolAttendance {
+                    $existing = $this->lockTodaysRecord((int) $student->getKey(), $dateString);
+
+                    return $mode === self::MODE_MASUK
+                        ? $this->recordCheckIn($existing, $student, $teacher, $user, $request, $dateString, $moment)
+                        : $this->recordCheckOut($existing, $student, $teacher, $user, $request, $dateString, $moment);
+                });
+            } catch (UniqueConstraintViolationException $e) {
+                // (7) Penjaga terakhir: dua request MASUK hampir bersamaan untuk
+                // siswa & tanggal sama -> hanya satu baris yang boleh ada.
+                throw $this->raceDuplicateException($student, $dateString, $e);
+            }
+        } catch (ScanRejectionException $e) {
+            // (8) Audit PRD 04 §9.1 dengan outcome eksplisit.
+            //
+            // Ditulis DI SINI (setelah DB::transaction() di atas di-rollback),
+            // bukan di dalam transaksi: kalau di dalam, baris audit-nya ikut
+            // ter-rollback sehingga event scan yang benar-benar terjadi hilang
+            // dari jejak. audit_logs bersifat append-only dan tidak pernah
+            // menjadi bagian transaksi absensi (PRD 04 §9.2).
+            //
+            // Exception tetap dilempar ulang -> perilaku HTTP tidak berubah
+            // (422 redirect-back dengan pesan $errors, bukan 500).
+            $this->auditRejectedScan($user, $teacher, $request, $e);
+
+            throw $e;
         }
     }
 
@@ -289,10 +340,19 @@ class SchoolAttendanceScanService
         if ($existing !== null && $existing->check_in_time !== null) {
             // ADDENDUM §3: record baru TIDAK dibuat. Jam yang sudah tercatat
             // dikembalikan agar guru tahu siswa ini sudah absen (AC-SCAN-03).
-            throw ValidationException::withMessages([
-                'check_in_time' => 'ABSENSI SUDAH TERCATAT. Sudah tercatat masuk pukul '
+            //
+            // Ditolak -> transaksi di-rollback, lalu scan() mengaudit outcome ini
+            // di luar transaksi (attendance_changed = false).
+            throw ScanRejectionException::reject(
+                outcome: self::OUTCOME_DUPLICATE_MASUK,
+                field: 'check_in_time',
+                message: 'ABSENSI SUDAH TERCATAT. Sudah tercatat masuk pukul '
                     . $existing->check_in_time->format('H:i') . '.',
-            ]);
+                scanContext: [
+                    'attendance_id' => (int) $existing->getKey(),
+                    'waktu_tercatat' => $existing->check_in_time->format('Y-m-d H:i:s'),
+                ],
+            );
         }
 
         if ($existing !== null) {
@@ -341,17 +401,28 @@ class SchoolAttendanceScanService
         // DITOLAK. Dilarang membuat check_in palsu / auto-create record MASUK,
         // karena itu jalur ini TIDAK PERNAH memanggil SchoolAttendance::create().
         if ($existing === null || $existing->check_in_time === null) {
-            throw ValidationException::withMessages([
-                'check_out_time' => self::MESSAGE_NO_CHECK_IN,
-            ]);
+            throw ScanRejectionException::reject(
+                outcome: self::OUTCOME_PULANG_WITHOUT_MASUK,
+                field: 'check_out_time',
+                message: self::MESSAGE_NO_CHECK_IN,
+                scanContext: $existing === null
+                    ? ['alasan' => 'no_attendance_row_today']
+                    : ['attendance_id' => (int) $existing->getKey(), 'alasan' => 'check_in_time_null'],
+            );
         }
 
         if ($existing->check_out_time !== null) {
             // ADDENDUM §5: update kedua ditolak, nilai lama tetap utuh.
-            throw ValidationException::withMessages([
-                'check_out_time' => 'ABSENSI PULANG SUDAH TERCATAT. Sudah tercatat pulang pukul '
+            throw ScanRejectionException::reject(
+                outcome: self::OUTCOME_DUPLICATE_PULANG,
+                field: 'check_out_time',
+                message: 'ABSENSI PULANG SUDAH TERCATAT. Sudah tercatat pulang pukul '
                     . $existing->check_out_time->format('H:i') . '.',
-            ]);
+                scanContext: [
+                    'attendance_id' => (int) $existing->getKey(),
+                    'waktu_tercatat' => $existing->check_out_time->format('Y-m-d H:i:s'),
+                ],
+            );
         }
 
         $existing->update([
@@ -393,9 +464,14 @@ class SchoolAttendanceScanService
         $mode = is_string($value) ? strtoupper(trim($value)) : '';
 
         if (! in_array($mode, self::MODES, true)) {
-            throw ValidationException::withMessages([
-                'mode' => 'Mode scan tidak valid. Pilih MASUK atau PULANG.',
-            ]);
+            throw ScanRejectionException::reject(
+                outcome: self::OUTCOME_MODE_INVALID,
+                field: 'mode',
+                message: 'Mode scan tidak valid. Pilih MASUK atau PULANG.',
+                // Mode yang ditolak TIDAK dikembalikan sebagai nilai: cukup
+                // panjangnya, agar payload klien tidak ikut tersimpan.
+                scanContext: ['mode_received_length' => mb_strlen($mode)],
+            );
         }
 
         return $mode;
@@ -406,15 +482,21 @@ class SchoolAttendanceScanService
         $barcode = is_string($value) ? trim($value) : '';
 
         if ($barcode === '') {
-            throw ValidationException::withMessages([
-                'barcode' => 'Barcode wajib diisi.',
-            ]);
+            throw ScanRejectionException::reject(
+                outcome: self::OUTCOME_BARCODE_EMPTY,
+                field: 'barcode',
+                message: 'Barcode wajib diisi.',
+            );
         }
 
         if (mb_strlen($barcode) > self::MAX_BARCODE_LENGTH) {
-            throw ValidationException::withMessages([
-                'barcode' => 'Barcode tidak valid.',
-            ]);
+            throw ScanRejectionException::reject(
+                outcome: self::OUTCOME_BARCODE_TOO_LONG,
+                field: 'barcode',
+                message: 'Barcode tidak valid.',
+                // Panjang saja, bukan isinya.
+                scanContext: ['barcode_length' => mb_strlen($barcode)],
+            );
         }
 
         return $barcode;
@@ -431,16 +513,27 @@ class SchoolAttendanceScanService
             ->first();
 
         if ($student === null) {
-            throw ValidationException::withMessages([
-                'barcode' => 'Barcode tidak ditemukan pada data siswa.',
-            ]);
+            // Barcode TIDAK disimpan di audit: yang bocor di sini justru bisa
+            // menjadi nomor kartu siswa orang lain (PRD 04 §9.2).
+            throw ScanRejectionException::reject(
+                outcome: self::OUTCOME_BARCODE_NOT_FOUND,
+                field: 'barcode',
+                message: 'Barcode tidak ditemukan pada data siswa.',
+            );
         }
 
         if (! $this->isStudentActive($student)) {
-            throw ValidationException::withMessages([
-                'barcode' => 'Siswa ' . $student->full_name
+            throw ScanRejectionException::reject(
+                outcome: self::OUTCOME_STUDENT_NOT_ACTIVE,
+                field: 'barcode',
+                message: 'Siswa ' . $student->full_name
                     . ' tidak berstatus aktif (status: ' . ($student->status ?: '-') . '). Scan ditolak.',
-            ]);
+                scanContext: [
+                    'student_id' => (int) $student->getKey(),
+                    'nis' => $student->nis,
+                    'status_siswa' => (string) ($student->status ?: '-'),
+                ],
+            );
         }
 
         return $student;
@@ -460,7 +553,7 @@ class SchoolAttendanceScanService
      * `ValidationException` TIDAK memiliki method `previous()`, jadi cause
      * dicatat ke log aplikasi (PRD 04 §10 / OWASP A09) tanpa nilai sensitif.
      */
-    private function raceDuplicateException(Student $student, string $dateString, Throwable $e): ValidationException
+    private function raceDuplicateException(Student $student, string $dateString, Throwable $e): ScanRejectionException
     {
         Log::warning('School attendance duplicate caught by database constraint', [
             'reason' => 'unique_constraint_raced_past_guard',
@@ -469,9 +562,12 @@ class SchoolAttendanceScanService
             'cause' => $e::class,
         ]);
 
-        return ValidationException::withMessages([
-            'check_in_time' => 'ABSENSI SUDAH TERCATAT. Perubahan tidak disimpan.',
-        ]);
+        return ScanRejectionException::reject(
+            outcome: self::OUTCOME_DUPLICATE_RACE,
+            field: 'check_in_time',
+            message: 'ABSENSI SUDAH TERCATAT. Perubahan tidak disimpan.',
+            scanContext: ['student_id' => (int) $student->getKey()],
+        );
     }
 
     // -----------------------------------------------------------------
@@ -481,10 +577,19 @@ class SchoolAttendanceScanService
     /**
      * Aksi `SCHOOL_ATT_SCAN` — scan masuk/pulang siswa oleh Guru Piket.
      *
-     * Hanya mutasi BERHASIL yang diaudit (konvensi sama dengan jadwal piket:
-     * permintaan yang ditolak tidak boleh tercatat sebagai sukses). Payload
-     * dibatasi data non-sensitif (PRD 04 §9.2): tanpa token, cookie, kata
-     * sandi, atau nilai konfigurasi.
+     * PRD 04 §9.1 mendefinisikan event-nya sebagai TINDAKAN
+     * "Guru Piket melakukan scan barcode siswa", BUKAN sebagai hasil mutasi.
+     * Karena itu setiap scan dari guru yang sah secara otorisasi menghasilkan
+     * SATU baris SCHOOL_ATT_SCAN - termasuk yang ditolak - dan kolom `outcome`
+     * membedakan hasilnya (pola yang sama dipakai AUTH_LOGIN_SUCCESS /
+     * AUTH_LOGIN_FAILED pada tabel PRD yang sama).
+     *
+     * `attendance_changed` dibuat eksplisit agar tidak ada kemungkinan salah
+     * baca: outcome gagal selalu false, jadi audit gagal tidak pernah dapat
+     * disalahartikan sebagai absensi sukses (PRD 04 §9.2).
+     *
+     * Payload dibatasi data non-sensitif: TANPA barcode mentah, token, cookie,
+     * kata sandi, atau nilai konfigurasi.
      */
     private function auditScan(
         User $actor,
@@ -502,6 +607,8 @@ class SchoolAttendanceScanService
             target: $attendance,
             oldValues: null,
             newValues: [
+                'outcome' => self::OUTCOME_SCAN_SUCCESS,
+                'attendance_changed' => true,
                 'attendance_id' => (int) $attendance->getKey(),
                 'student_id' => (int) $student->getKey(),
                 'student_nis' => $student->nis,
@@ -514,6 +621,95 @@ class SchoolAttendanceScanService
                 'operator_teacher_id' => (int) $teacher->getKey(),
                 'operator_nama' => $teacher->full_name,
             ],
+            request: $request,
+        );
+    }
+
+    /**
+     * Audit atas scan yang DITOLAK server (PRD 04 §9.1, outcome eksplisit).
+     *
+     * Dipanggil scan() SETELAH DB::transaction() selesai di-rollback, sehingga:
+     *  - baris audit tetap ada (append-only) walau mutasi absensi dibatalkan;
+     *  - tidak ada satupun kolom attendance yang tersimpan dari scan gagal;
+     *  - respons HTTP tetap penolakan validasi biasa (bukan 500).
+     *
+     * `entity` Sengaja tidak menunjuk baris absensi bila barisnya tidak jadi
+     * dibuat/diubah (auditable_id = null); penelusuran cukup lewat actor +
+     * waktu + student_id/NIS pada payload bila siswa terselesaikan.
+     */
+    private function auditRejectedScan(
+        User $actor,
+        Teacher $teacher,
+        Request $request,
+        ScanRejectionException $rejection,
+    ): void {
+        $this->writeRejectedAudit(
+            $actor,
+            $teacher,
+            $request,
+            $rejection->scanOutcome,
+            $rejection->scanContext,
+        );
+    }
+
+    /**
+     * Audit percobaan scan yang bentuk inputnya ditolak validasi FORM
+     * (mode invalid / barcode kosong / barcode terlalu panjang).
+     *
+     * Kenapa perlu jalur sendiri? FormRequest dieksekusi SEBELUM service, jadi
+     * penolakan bentuk input tidak pernah menyentuh scan(). Peristiwa scan-nya
+     * tetap nyata: guru yang sudah sah sebagai Guru Piket menekan MASUK/PULANG
+     * lalu mengirim kartu (PRD 04 §9.1 mencatat AKSI scan-nya).
+     *
+     * Gerbang otorisasi tetap dijaga: status piket dibaca ULANG dari database,
+     * dan bila guru ternyata tidak bertugas maka TIDAK ada audit scan apa pun —
+     * persis seperti penolakan 403 di middleware (permintaan ditolak sebelum
+     * event scan Guru Piket terjadi).
+     */
+    public function auditRejectedAttempt(Request $request, ?User $user, string $outcome, array $context = []): void
+    {
+        if ($user === null) {
+            return;
+        }
+
+        $teacher = $this->findOnDutyTeacher($request, $user);
+
+        if ($teacher === null) {
+            return;
+        }
+
+        $this->writeRejectedAudit($user, $teacher, $request, $outcome, $context);
+    }
+
+    /**
+     * Satu tempat penulisan audit gagal: barcode/value klien apa pun dibuang
+     * sebelum ditulis (PRD 04 §9.2), dan attendance_changed selalu false.
+     *
+     * @param  array<string, mixed>  $context
+     */
+    private function writeRejectedAudit(
+        User $actor,
+        Teacher $teacher,
+        Request $request,
+        string $outcome,
+        array $context,
+    ): void {
+        // Barcode tidak pernah masuk payload, apa pun isinya (lapisan kedua
+        // setelah resolveStudent()/resolveBarcode() memang tidak mengirimnya).
+        unset($context['barcode'], $context['barcode_code'], $context['mode_received']);
+
+        AuditService::logDataChange(
+            actor: $actor,
+            action: AuditLog::ACTION_SCHOOL_ATT_SCAN,
+            target: SchoolAttendance::class,
+            oldValues: null,
+            newValues: [
+                'outcome' => $outcome,
+                'attendance_changed' => false,
+                'attendance_date' => $this->duty->currentDutyDate(),
+                'operator_teacher_id' => (int) $teacher->getKey(),
+                'operator_nama' => $teacher->full_name,
+            ] + $context,
             request: $request,
         );
     }

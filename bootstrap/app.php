@@ -1,5 +1,6 @@
 <?php
 
+use App\Support\ErrorMask;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -47,4 +48,28 @@ return Application::configure(basePath: dirname(__DIR__))
         $exceptions->shouldRenderJsonWhen(
             fn (Request $request) => $request->is('api/*') || $request->expectsJson(),
         );
+
+        // PRD 04 §10.1 — ERROR MASKING (lapis kedua).
+        //
+        // Lapis pertama = resources/views/errors/{4xx,5xx}.blade.php milik
+        // aplikasi. View itu MENANG atas view vendor (path aplikasi didaftarkan
+        // lebih dulu oleh RegisterErrorViewPaths) dan dipakai untuk status HTTP
+        // >= 400 BAHKAN ketika APP_DEBUG=true, karena Handler::renderHttpException()
+        // dipanggil sebelum renderer debug Symfony.
+        //
+        // Tanpa view tersebut, status yang tidak punya view bawaan — contohnya
+        // 405 Method Not Allowed — jatuh ke Symfony HtmlErrorRenderer dan pada
+        // APP_DEBUG=true mengirim halaman debug ±867 kB berisi 358 path file
+        // framework + FQCN exception (hasil probe nyata pada server development).
+        //
+        // Callback ini menyaring APA PUN response error >= 400 yang masih
+        // tersisa saat mode produksi (debug=false): halaman debug framework
+        // diganti halaman generik, dan key exception/file/line/trace pada payload
+        // JSON debug dibuang. Response < 400 dan mode debug tidak disentuh sama
+        // sekali, jadi alur development pengembang tidak berubah.
+        //
+        // config('app.debug') dibaca SAAT request berjalan (bukan saat bootstrap)
+        // supaya test dapat memproduksi kedua mode tanpa mengubah .env
+        // development milik pengguna.
+        $exceptions->respond(fn ($response) => ErrorMask::apply($response));
     })->create();

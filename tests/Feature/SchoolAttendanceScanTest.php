@@ -390,10 +390,21 @@ class SchoolAttendanceScanTest extends TestCase
 
         $attendance = SchoolAttendance::whereDate('attendance_date', self::SERVER_DATE)->sole();
         $this->assertSame('2026-09-28 07:15:00', $attendance->check_in_time->format('Y-m-d H:i:s'), 'Jam lama tidak tertimpa.');
-        $this->assertSame(1, DB::table('student_school_attendances')->count());
 
-        // Scan yang ditolak tidak boleh diaudit sebagai sukses.
-        $this->assertSame(1, AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)->count());
+        // Scan yang ditolak TIDAK tercatat sebagai sukses, tapi tetap diaudit
+        // dengan outcome eksplisit (PRD 04 §9.1).
+        $audits = AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)
+            ->orderBy('id')
+            ->pluck('new_values')
+            ->map(fn ($v) => (array) $v)
+            ->all();
+
+        $this->assertCount(2, $audits, 'Satu baris audit per percobaan scan: sukses + ditolak.');
+        $this->assertTrue((bool) $audits[0]['attendance_changed']);
+        $this->assertSame('SCAN_SUCCESS', $audits[0]['outcome']);
+        $this->assertFalse((bool) $audits[1]['attendance_changed'], 'Penolakan tidak mengubah data.');
+        $this->assertSame('DUPLICATE_MASUK', $audits[1]['outcome']);
+        $this->assertSame(1, DB::table('student_school_attendances')->count(), 'Audit gagal tidak ikut menyalakan baris absensi.');
     }
 
     // =================================================================
@@ -444,7 +455,13 @@ class SchoolAttendanceScanTest extends TestCase
             SchoolAttendance::count(),
             'Dilarang auto-create record atau membuat check_in palsu saat scan PULANG.'
         );
-        $this->assertSame(0, AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)->count());
+
+        $audit = AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)->sole();
+        $outcome = (array) $audit->new_values;
+
+        $this->assertSame('PULANG_WITHOUT_MASUK', $outcome['outcome']);
+        $this->assertFalse((bool) $outcome['attendance_changed']);
+        $this->assertSame('no_attendance_row_today', $outcome['alasan']);
     }
 
     public function test_rejected_scan_messages_are_rendered_on_the_next_page_load(): void
@@ -500,7 +517,19 @@ class SchoolAttendanceScanTest extends TestCase
 
         $attendance = SchoolAttendance::sole();
         $this->assertSame('2026-09-28 13:05:00', $attendance->check_out_time->format('Y-m-d H:i:s'));
-        $this->assertSame(2, AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)->count(), 'Hanya 2 scan sukses diaudit.');
+
+        $outcomes = AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)
+            ->orderBy('id')
+            ->pluck('new_values')
+            ->map(fn ($v) => is_string($v) ? json_decode($v, true) : (array) $v)
+            ->pluck('outcome')
+            ->all();
+
+        $this->assertSame(
+            ['SCAN_SUCCESS', 'SCAN_SUCCESS', 'DUPLICATE_PULANG'],
+            $outcomes,
+            'Dua scan sukses + satu penolakan duplikat, masing-masing dengan outcome sendiri.'
+        );
     }
 
     // =================================================================
@@ -731,8 +760,18 @@ class SchoolAttendanceScanTest extends TestCase
         // JAMINAN: transaksi atomik -> baris pesaing ikut ter-rollback.
         $this->assertSame(0, DB::table('student_school_attendances')->count(), 'Permintaan yang kalah di-rollback.');
 
-        // Permintaan gagal tidak diaudit sebagai scan sukses.
-        $this->assertSame(0, AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)->count());
+        // Peristiwa scan-nya TETAP teraudit (write-after-rollback), tapi tidak
+        // pernah tercatat sebagai perubahan absensi.
+        $audit = AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)->sole();
+        $outcome = is_string($audit->new_values) ? json_decode($audit->new_values, true) : (array) $audit->new_values;
+
+        $this->assertSame('DUPLICATE_RACE_DATABASE_CONSTRAINT', $outcome['outcome']);
+        $this->assertFalse((bool) $outcome['attendance_changed']);
+        $this->assertSame(
+            0,
+            DB::table('student_school_attendances')->count(),
+            'Menulis audit setelah rollback tidak boleh ikut menyalakan baris absensi.'
+        );
 
         // Log aplikasi mencatat penyebabnya TANPA menampilkannya ke klien (PRD 04 §10).
         $this->assertStringNotContainsString('UniqueConstraintViolation', (string) session('errors')->first('check_in_time'));
@@ -1213,5 +1252,404 @@ class SchoolAttendanceScanTest extends TestCase
                 ->filter(fn ($r) => str_contains(strtolower($r->uri()), 'teacher-attendance'))
                 ->all()
         );
+    }
+
+    // =================================================================
+    // L. SEMANTIK AUDIT SCHOOL_ATT_SCAN (koreksi Adjustment D)
+    //
+    // PRD 04 §9.1 mendefinisikan event-nya sebagai TINDAKAN "Guru Piket
+    // melakukan scan barcode siswa", BUKAN sebagai hasil mutasi. Karena itu
+    // setiap percobaan scan dari guru yang SAH secara otorisasi menghasilkan
+    // satu baris audit dengan `outcome` eksplisit, dan kolom
+    // `attendance_changed` membedakan "ada perubahan absensi" dari "tidak".
+    // Penolakan SEBELUM event scan (bukan Guru Piket / role lain / tamu)
+    // tetap TIDAK menghasilkan audit scan apa pun (PRD 02 §4b butir 1).
+    // =================================================================
+
+    /** @return array<string, mixed> outcome yang tercatat,urut pemanggilan */
+    private function scanOutcomes(): array
+    {
+        return AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)
+            ->orderBy('id')
+            ->pluck('new_values')
+            ->map(fn ($v) => (array) $v)
+            ->pluck('outcome')
+            ->all();
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    private function scanAuditPayloads(): array
+    {
+        return AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)
+            ->orderBy('id')
+            ->pluck('new_values')
+            ->map(fn ($v) => (array) $v)
+            ->all();
+    }
+
+    public function test_every_scan_event_from_an_authorized_teacher_is_audited_with_its_outcome(): void
+    {
+        [$teacherUser] = $this->onDutyTeacher('guru_matriks_outcome');
+        $aktif = $this->makeStudent('26270750');
+        $nonAktif = $this->makeStudent('26270751', 'MUTASI');
+        $belumMasuk = $this->makeStudent('26270752');
+
+        // 1. scan berhasil (MASUK).
+        $this->scan($teacherUser, $aktif->barcode_code, 'MASUK')->assertSessionHasNoErrors();
+        // 2. duplicate MASUK.
+        $this->scan($teacherUser, $aktif->barcode_code, 'MASUK')->assertSessionHasErrors('check_in_time');
+        // 3. scan berhasil (PULANG).
+        $this->travelTo('2026-09-28 13:05:00');
+        $this->scan($teacherUser, $aktif->barcode_code, 'PULANG')->assertSessionHasNoErrors();
+        // 4. duplicate PULANG.
+        $this->scan($teacherUser, $aktif->barcode_code, 'PULANG')->assertSessionHasErrors('check_out_time');
+        // 5. barcode tidak ditemukan.
+        $this->scan($teacherUser, 'TIDAKADA99', 'MASUK')->assertSessionHasErrors('barcode');
+        // 6. siswa non-aktif.
+        $this->scan($teacherUser, $nonAktif->barcode_code, 'MASUK')->assertSessionHasErrors('barcode');
+        // 7. PULANG tanpa MASUK (Keputusan A1).
+        $this->scan($teacherUser, $belumMasuk->barcode_code, 'PULANG')->assertSessionHasErrors('check_out_time');
+        // 8. mode invalid -> ditahan FormRequest SEBELUM service (jalur audit terpisah).
+        $this->scan($teacherUser, $aktif->barcode_code, 'AUTO')->assertSessionHasErrors('mode');
+        // 9. barcode kosong -> juga ditahan FormRequest.
+        $this->scan($teacherUser, '', 'MASUK')->assertSessionHasErrors('barcode');
+        // 10. barcode terlalu panjang -> juga ditahan FormRequest.
+        $this->scan($teacherUser, str_repeat('9', 60), 'MASUK')->assertSessionHasErrors('barcode');
+
+        $this->assertSame(
+            [
+                'SCAN_SUCCESS',
+                'DUPLICATE_MASUK',
+                'SCAN_SUCCESS',
+                'DUPLICATE_PULANG',
+                'BARCODE_NOT_FOUND',
+                'STUDENT_NOT_ACTIVE',
+                'PULANG_WITHOUT_MASUK',
+                'MODE_INVALID',
+                'BARCODE_EMPTY',
+                'BARCODE_TOO_LONG',
+            ],
+            $this->scanOutcomes(),
+            'Setiap peristiwa scan Guru Piket wajib menghasilkan SATU audit dengan outcome sendiri.'
+        );
+
+        // Outcome gagal tidak pernah tercatat sebagai perubahan absensi.
+        foreach ($this->scanAuditPayloads() as $payload) {
+            $changed = array_key_exists('attendance_changed', $payload)
+                ? (bool) $payload['attendance_changed']
+                : null;
+
+            $this->assertNotNull($changed, 'Setiap baris audit scan wajib punya flag attendance_changed.');
+            $this->assertSame($payload['outcome'] === 'SCAN_SUCCESS', $changed, 'Hanya SCAN_SUCCESS yang mengubah absensi.');
+        }
+
+        // Tidak ada baris absensi tambahan dari seluruh penolakan: hanya siswa yang
+        // scan-nya sukses (MASUK + PULANG) yang punya baris.
+        $this->assertSame(
+            1,
+            DB::table('student_school_attendances')->count(),
+            'Hanya peristiwa SCAN_SUCCESS yang boleh meninggalkan baris absensi.'
+        );
+
+        $this->assertSame(
+            [$aktif->id],
+            DB::table('student_school_attendances')->pluck('student_id')->map(fn ($v) => (int) $v)->all(),
+            'Baris yang tersisa harus milik siswa yang discan sukses.'
+        );
+
+        // Keputusan A1 tetap utuh: siswa tanpa MASUK tidak dapat baris hasil PULANG.
+        $this->assertSame(0, DB::table('student_school_attendances')->where('student_id', $belumMasuk->id)->count());
+        $this->assertSame(0, DB::table('student_school_attendances')->where('student_id', $nonAktif->id)->count());
+    }
+
+    public function test_rejected_scan_audits_never_contain_the_scanned_barcode_or_secrets(): void
+    {
+        [$teacherUser] = $this->onDutyTeacher('guru_audit_sanitasi');
+        $student = $this->makeStudent('26270753');
+
+        // Barcode sengaja DIBEDAKAN dari NIS agar bisa dibuktikan: yang dilarang
+        // tersimpan adalah barcode mentah, bukan identitas siswa yang sah.
+        $barcode = 'BCG-26270753';
+        $student->update(['barcode_code' => $barcode]);
+
+        // Semua jalur penolakan sekaligus: unknown / non-aktif / kepanjangan / kosong / mode.
+        $this->scan($teacherUser, 'TIDAKADA99', 'MASUK');
+        $this->scan($teacherUser, $barcode . 'X', 'PULANG');
+        $this->scan($teacherUser, $barcode, 'AUTO');
+        $this->scan($teacherUser, '', 'PULANG');
+        $this->scan($teacherUser, str_repeat('9', 60), 'MASUK');
+        $this->scan($teacherUser, $barcode, 'MASUK')->assertSessionHasNoErrors();
+
+        $raw = strtolower((string) json_encode($this->scanAuditPayloads(), JSON_THROW_ON_ERROR));
+
+        // Barcode penuh (milik siswa yang dikenal maupun tebakan) DILARANG tersimpan.
+        foreach ([$barcode, $barcode . 'x', 'tidakada99', str_repeat('9', 60)] as $leak) {
+            $this->assertStringNotContainsString($leak, $raw, 'Payload audit memuat nilai klien: ' . $leak);
+        }
+
+        foreach (['password', 'rahasia123', 'remember_token', '_token', 'app_key', 'cookie', 'bearer'] as $secret) {
+            $this->assertStringNotContainsString($secret, $raw, 'Payload audit memuat kata sensitif: ' . $secret);
+        }
+
+        $this->assertSame(1, DB::table('student_school_attendances')->count(), 'Penolakan tidak membuat baris absensi.');
+    }
+
+    public function test_requests_refused_before_the_scan_event_never_write_a_scan_audit(): void
+    {
+        // (a) guru TANPA jadwal piket mencoba scan -> 403, nol audit.
+        [$bukanPiket] = $this->makeTeacherUser('guru_nol_audit');
+        $this->scan($bukanPiket, '26270754', 'MASUK')->assertStatus(403);
+
+        // (b) role non-guru -> role:teacher menolak sebelum apa pun terjadi.
+        $admin = $this->makeUser(User::ROLE_ADMIN, 'admin_nol_audit');
+        $supervisor = $this->makeUser(User::ROLE_SUPERVISOR, 'kepsek_nol_audit');
+        $this->scan($admin, '26270754', 'MASUK')->assertForbidden();
+        $this->scan($supervisor, '26270754', 'MASUK')->assertForbidden();
+
+        $this->assertSame(
+            0,
+            AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)->count(),
+            'Penolakan sebelum event scan Guru Piket tidak boleh menghasilkan audit scan.'
+        );
+        $this->assertSame(0, SchoolAttendance::count());
+    }
+
+    /**
+     * Berlari sebagai test TERSENDIRI karena actingAs() pada test lain
+     * meninggalkan user pada guard, sehingga request "tamu" tidak lagi
+     * benar-benar tamu.
+     */
+    public function test_a_guest_scan_post_is_redirected_to_login_without_any_scan_audit(): void
+    {
+        // Tamu -> redirect login, bukan peristiwa scan Guru Piket.
+        $this->post(route('guru.school-attendance-scanner.store'), ['barcode' => '26270754', 'mode' => 'MASUK'])
+            ->assertRedirect(route('login'));
+
+        $this->assertSame(
+            0,
+            AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)->count(),
+            'Permintaan tamu bukan peristiwa scan Guru Piket dan tidak boleh diaudit.'
+        );
+        $this->assertSame(0, SchoolAttendance::count());
+    }
+
+    public function test_scan_attempt_by_a_non_on_duty_teacher_is_not_audited_even_when_form_validation_fails(): void
+    {
+        // Jalur FormRequest (failedValidation) juga wajib menghormati gerbang
+        // otorisasi: mode invalid dari guru non-piket -> 403, nol audit scan.
+        [$bukanPiket] = $this->makeTeacherUser('guru_mode_invalid_non_duty');
+
+        $this->scan($bukanPiket, '26270755', 'AUTO')->assertStatus(403);
+
+        $this->assertSame(0, AuditLog::where('action', AuditLog::ACTION_SCHOOL_ATT_SCAN)->count());
+    }
+
+    public function test_rejection_audit_survives_the_attendance_transaction_rollback(): void
+    {
+        // Inti desain transaction-safe: penolakan terjadi DI DALAM
+        // DB::transaction(), jadi audit ditulis SETELAH rollback. Baris absensi
+        // tetap tidak bertambah, audit tetap ada, dan tidak ada HTTP 500.
+        [$teacherUser] = $this->onDutyTeacher('guru_audit_tahan_rollback');
+        $student = $this->makeStudent('26270756');
+
+        $this->scan($teacherUser, $student->barcode_code, 'MASUK')->assertSessionHasNoErrors();
+        $rowsAfterSuccess = DB::table('student_school_attendances')->count();
+
+        $this->travelTo('2026-09-28 07:45:00');
+        $rejected = $this->scan($teacherUser, $student->barcode_code, 'MASUK');
+
+        $this->assertNotSame(500, $rejected->getStatusCode(), 'Penolakan wajib menjadi 422/redirect, bukan 500.');
+        $rejected->assertRedirect()->assertSessionHasErrors('check_in_time');
+
+        $this->assertSame($rowsAfterSuccess, DB::table('student_school_attendances')->count(), 'Rollback tetap utuh.');
+        $this->assertSame(['SCAN_SUCCESS', 'DUPLICATE_MASUK'], $this->scanOutcomes());
+
+        $penolakan = $this->scanAuditPayloads()[1];
+        $this->assertFalse((bool) $penolakan['attendance_changed']);
+        $this->assertSame('2026-09-28', $penolakan['attendance_date']);
+        $this->assertGreaterThan(0, (int) $penolakan['operator_teacher_id'], 'Operator tercatat sebagai guru sesi.');
+    }
+
+    // =================================================================
+    // M. ERROR RESPONSE TIDAK BOLEH MEMBOCORKAN DETAIL INTERNAL
+    //
+    // Root cause terukur: response 405 pada APP_DEBUG=true = ±867 kB dan
+    // memuat 358 path file framework. Framework hanya punya view error untuk
+    // 401/402/403/404/419/429/500/503, jadi 405 jatuh ke Symfony
+    // HtmlErrorRenderer. Perbaikan: view errors/4xx + errors/5xx milik
+    // aplikasi (menang atas vendor) + App\Support\ErrorMask saat debug=false.
+    //
+    // config('app.debug') DI-TOGGLE di dalam test (bukan .env pengguna).
+    // =================================================================
+
+    /**
+     * @return array<string, string>
+     *
+     * Delimiter `~` dipakai karena pola ini memuat URL (mysql://, sqlite://)
+     * yang akan memutus delimiter `/`.
+     */
+    private function forbiddenLeakPatterns(): array
+    {
+        return [
+            'stack trace frame' => '~#\d+\s+.{0,200}\.php(\(|:)~i',
+            'vendor path' => '~vendor[\\\\/](laravel|symfony|composer)~i',
+            'app source path' => '~(?:app|routes|bootstrap|resources|storage)[\\\\/][\w\\/.+-]*\.php~i',
+            'workspace path' => '~[A-Za-z]:[\\\\/](?:anti|Users)[\\\\/]~',
+            'framework debug page' => '~MethodNotAllowedHttpException|NotFoundHttpException|AccessDeniedHttpException|HttpException~',
+            'framework class' => '~Illuminate\\\\|Symfony\\\\Component|Carbon\\\\~',
+            'APP_KEY' => '~APP_KEY|base64:[A-Za-z0-9+/=]{20,}~',
+            'db credential' => '~DB_PASSWORD|DB_USERNAME|mysql://|sqlite://~i',
+            'session token' => '~"_token"\s*:\s*"[A-Za-z0-9]{20,}|eyJpdiI6~',
+            'php config' => '~phpinfo\(\)|PHP Version \d|Zend Engine~i',
+        ];
+    }
+
+    private function assertNoInternalLeak(\Illuminate\Testing\TestResponse | \Symfony\Component\HttpFoundation\Response $response, string $label): void
+    {
+        $body = (string) $response->getContent();
+
+        $this->assertNotEmpty($body, "Response {$label} kosong.");
+
+        foreach ($this->forbiddenLeakPatterns() as $name => $pattern) {
+            $this->assertDoesNotMatchRegularExpression(
+                $pattern,
+                $body,
+                "Response {$label} membocorkan {$name}."
+            );
+        }
+    }
+
+    public function test_method_not_allowed_response_never_renders_the_framework_debug_page(): void
+    {
+        // Rute scanner HANYA menerima GET/POST; PUT wajib menghasilkan 405.
+        $url = route('guru.school-attendance-scanner.index');
+
+        foreach ([true, false] as $debug) {
+            config(['app.debug' => $debug]);
+
+            $response = $this->put($url, ['barcode' => '26270760', 'mode' => 'MASUK']);
+
+            $this->assertSame(405, $response->getStatusCode(), 'PUT pada rute scanner wajib 405.');
+
+            // Header Allow = metadata HTTP standar (daftar metode), BUKAN detail internal.
+            $allow = (string) $response->headers->get('allow');
+            $this->assertStringContainsString('POST', $allow, 'Rute scanner menerima POST; header Allow wajib informatif.');
+            $this->assertDoesNotMatchRegularExpression('/php|illuminate|symfony/i', $allow);
+
+            // Body halaman debug terukur 866.845 byte sebelum perbaikan.
+            $this->assertLessThan(
+                20_000,
+                strlen((string) $response->getContent()),
+                'Response 405 (debug=' . var_export($debug, true) . ') masih berupa halaman debug framework.'
+            );
+
+            $this->assertNoInternalLeak($response, '405 debug=' . var_export($debug, true));
+        }
+    }
+
+    public function test_production_like_error_responses_do_not_leak_internal_details(): void
+    {
+        // production-like: debug=false, TANPA menyentuh .env development.
+        config(['app.debug' => false]);
+
+        // 404: rute tidak dikenal.
+        $notFound = $this->get('/rute-yang-tidak-ada-xyz');
+        $this->assertSame(404, $notFound->getStatusCode());
+        $this->assertNoInternalLeak($notFound, '404');
+
+        // 405: metode tidak diizinkan untuk rute yang ada.
+        $methodNotAllowed = $this->put(route('guru.school-attendance-scanner.index'));
+        $this->assertSame(405, $methodNotAllowed->getStatusCode());
+        $this->assertNoInternalLeak($methodNotAllowed, '405');
+
+        // 419: TokenMismatchException dipetakan framework ke status 419.
+        // (middleware CSRF melewati mode unit-test, jadi exception-nya
+        // dirender lewat handler nyata untuk menguji view status 419.)
+        $csrfRequest = Request::create(route('guru.school-attendance-scanner.store'), 'POST');
+        $csrf = app(\Illuminate\Contracts\Debug\ExceptionHandler::class)
+            ->render($csrfRequest, new TokenMismatchException('CSRF token mismatch.'));
+        $this->assertSame(419, $csrf->getStatusCode());
+        $this->assertNoInternalLeak($csrf, '419');
+
+        // 500: exception non-HTTP dari rute uji sementara.
+        Route::get('/__test/boom', function () {
+            throw new \RuntimeException('RAHASIA-INTERNAL-BOOM-DETAIL');
+        });
+        $serverError = $this->get('/__test/boom');
+        $this->assertSame(500, $serverError->getStatusCode());
+        $this->assertNoInternalLeak($serverError, '500');
+        $this->assertStringNotContainsString('RAHASIA-INTERNAL-BOOM-DETAIL', (string) $serverError->getContent(), 'Pesan exception wajib tertutup.');
+
+        // Header keamanan tetap menempel pada seluruh response error (PRD 04 §5.3).
+        foreach ([$notFound, $methodNotAllowed, $serverError] as $i => $response) {
+            $this->assertSame('nosniff', $response->headers->get('X-Content-Type-Options'), 'Header keamanan hilang pada error #' . $i);
+            $this->assertSame('SAMEORIGIN', $response->headers->get('X-Frame-Options'));
+        }
+    }
+
+    public function test_error_mask_replaces_a_framework_debug_page_and_keeps_application_views_intact(): void
+    {
+        config(['app.debug' => false]);
+
+        // (a) Body bergaya halaman debug framework -> wajib diganti total.
+        $debugPage = new \Symfony\Component\HttpFoundation\Response(
+            '<h1>Symfony\\Component\\HttpKernel\\Exception\\MethodNotAllowedHttpException</h1>'
+            . '<p>#0 D:\\anti\\portal-sekolah\\vendor\\laravel\\framework\\src\\Illuminate\\Routing\\Router.php(120): x()</p>'
+            . '<pre>APP_KEY=base64:RAHASIARAHASIA</pre>',
+            405
+        );
+        $masked = \App\Support\ErrorMask::apply($debugPage);
+        $body = (string) $masked->getContent();
+
+        $this->assertStringNotContainsString('vendor', $body);
+        $this->assertStringNotContainsString('Router.php', $body);
+        $this->assertStringNotContainsString('base64:RAHASIA', $body);
+        $this->assertStringNotContainsString('MethodNotAllowedHttpException', $body);
+        $this->assertStringContainsString('405', $body, 'Angka status tetap informatif bagi pengguna.');
+        $this->assertSame(405, $masked->getStatusCode(), 'Status code tidak boleh berubah.');
+
+        // (b) Payload JSON debug -> key internal dibuang, pesan UX dipertahankan.
+        $json = new \Illuminate\Http\JsonResponse([
+            'message' => 'The given data was invalid.',
+            'exception' => 'Illuminate\\Validation\\ValidationException',
+            'file' => 'D:\\anti\\portal-sekolah\\app\\Services\\X.php',
+            'line' => 42,
+            'trace' => [['file' => 'D:\\secret.php']],
+            'errors' => ['barcode' => ['Barcode wajib dipindai atau diisi.']],
+        ], 422);
+        $payload = \App\Support\ErrorMask::apply($json)->getData(true);
+
+        foreach (['exception', 'file', 'line', 'trace'] as $noise) {
+            $this->assertArrayNotHasKey($noise, $payload, 'Key debug JSON wajib dibuang: ' . $noise);
+        }
+        $this->assertSame('The given data was invalid.', $payload['message'], 'Pesan UX wajib dipertahankan.');
+        $this->assertSame(['barcode' => ['Barcode wajib dipindai atau diisi.']], $payload['errors']);
+
+        // (c) Response sukses / status < 400 TIDAK boleh disentuh.
+        $ok = new \Symfony\Component\HttpFoundation\Response('vendor/laravel biasa', 200);
+        $this->assertSame('vendor/laravel biasa', \App\Support\ErrorMask::apply($ok)->getContent());
+
+        // (d) debug=true -> helper tidak aktif (pengalaman development utuh),
+        //     dan view errors/4xx aplikasi tetap yang menjadi lapis pertama.
+        config(['app.debug' => true]);
+        $untouched = new \Symfony\Component\HttpFoundation\Response('#0 D:\\anti\\x.php(1): y()', 500);
+        $this->assertSame('#0 D:\\anti\\x.php(1): y()', \App\Support\ErrorMask::apply($untouched)->getContent());
+    }
+
+    public function test_scanner_locked_page_message_is_preserved_in_production_mode(): void
+    {
+        // Regression lawan dari over-masking: teks PRD yang aman & diperlukan UX
+        // wajib TETAP ada pada response 403 walau debug=false (PRD 04 §16.5).
+        config(['app.debug' => false]);
+
+        [$teacherUser] = $this->makeTeacherUser('guru_teks_utuh');
+
+        $response = $this->actingAs($teacherUser)->get(route('guru.school-attendance-scanner.index'));
+
+        $response->assertStatus(403)
+            ->assertSee('Anda hari ini bukan Guru Piket.', false)
+            ->assertSee(self::SERVER_DATE);
+
+        $this->assertNoInternalLeak($response, '403 scanner terkunci');
     }
 }

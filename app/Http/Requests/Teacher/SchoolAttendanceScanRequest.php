@@ -54,6 +54,53 @@ class SchoolAttendanceScanRequest extends FormRequest
     }
 
     /**
+     * Aturan validasi TIDAK dilonggarkan sedikit pun: parent tetap melempar
+     * ValidationException sehingga responsnya tetap redirect-back + $errors.
+     *
+     * Yang ditambahkan hanya JEJAK AUDIT atas peristiwa scan yang nyata terjadi
+     * (PRD 04 §9.1: event = "Guru Piket melakukan scan barcode siswa"). Form
+     * request ini jalan SEBELUM service, jadi tanpa hook ini penolakan bentuk
+     * input (mode invalid dsb.) tidak akan pernah tercatat sama sekali.
+     *
+     * auditRejectedAttempt() menilai ULANG status piket dari database dan
+     * sengaja tidak menulis apa pun bila guru tidak bertugas, sehingga jalur ini
+     * tidak bisa dipakai untuk menandai audit oleh non-Guru-Piket.
+     */
+    protected function failedValidation(\Illuminate\Contracts\Validation\Validator $validator)
+    {
+        $messages = $validator->errors()->messages();
+
+        $outcome = match (true) {
+            isset($messages['mode']) => SchoolAttendanceScanService::OUTCOME_MODE_INVALID,
+            isset($messages['barcode']) && $this->barcodeIsBlank() => SchoolAttendanceScanService::OUTCOME_BARCODE_EMPTY,
+            isset($messages['barcode']) => SchoolAttendanceScanService::OUTCOME_BARCODE_TOO_LONG,
+            default => null,
+        };
+
+        if ($outcome !== null) {
+            app(SchoolAttendanceScanService::class)->auditRejectedAttempt(
+                $this,
+                $this->user(),
+                $outcome,
+                // Hanya jumlah error + panjang input; TIDAK ada nilai klien.
+                [
+                    'error_fields' => array_keys($messages),
+                    'barcode_length' => is_string($this->input('barcode'))
+                        ? mb_strlen(trim((string) $this->input('barcode')))
+                        : 0,
+                ],
+            );
+        }
+
+        parent::failedValidation($validator);
+    }
+
+    private function barcodeIsBlank(): bool
+    {
+        return ! is_string($this->input('barcode')) || trim((string) $this->input('barcode')) === '';
+    }
+
+    /**
      * @return array<string, string>
      */
     public function messages(): array
