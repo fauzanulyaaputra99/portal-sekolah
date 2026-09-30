@@ -38,10 +38,17 @@ use Tests\TestCase;
  *  G. Pemalsuan identitas/tanggal/waktu dari klien diabaikan
  *  H. CSRF: rute dalam pipeline CSRF, form membawa token, dan token salah
  *     benar-benar ditolak oleh middleware (bukan sekadar diasumsikan)
- *  I. Balapan duplikat -> ditahan UNIQUE, tanpa HTTP 500, rollback, tanpa audit palsu
+ *  I. Balapan duplikat -> ditahan UNIQUE, tanpa HTTP 500, rollback; peristiwa scan
+ *     tetap teraudit dengan outcome DUPLICATE_RACE_DATABASE_CONSTRAINT
+ *     (attendance_changed = false), BUKAN sebagai audit sukses
  *  J. Monitoring + koreksi Admin/TU (alasan >= 10, audit SCHOOL_ATT_CORRECT,
  *     Supervisor read-only, tanggal record tidak dapat dipindah)
  *  K. Histori terkunci, header keamanan, dan tanpa penyimpanan di klien
+ *  L. Semantik audit SCHOOL_ATT_SCAN (koreksi fef294c): satu baris audit dengan
+ *     outcome eksplisit untuk SETIAP peristiwa scan dari guru sah, audit bersih
+ *     dari barcode/rahasia, dan NOL audit untuk penolakan sebelum peristiwa scan
+ *  M. Error masking (PRD 04 §10.1): response 404/405/419/500 production-like
+ *     maupun debug tidak membocorkan stack trace, path file, atau FQCN
  *
  * CATATAN: tidak ada tes kamera/getUserMedia sungguhan di sini. html5-qrcode
  * diverifikasi lewat build Vite (bundle terbit) + keberadaan elemen reader dan
@@ -286,6 +293,17 @@ class SchoolAttendanceScanTest extends TestCase
 
     // =================================================================
     // D. RESOLUSI BARCODE & MODE
+    //
+    // Seksi ini menguji AKSI HTTP + efek baris absensi. AUDIT-nya tidak
+    // hilang: setiap penolakan di bawah TETAP menghasilkan satu baris
+    // SCHOOL_ATT_SCAN dengan outcome sendiri, dan outcome itu di-assert
+    // terpusat di seksi L (test_every_scan_event_..._audited_with_its_outcome):
+    //   - mode kosong / 'AUTO' / barcode kosong / barcode > 50
+    //       ditahan FormRequest -> outcome dicatat auditRejectedAttempt()
+    //       (MODE_INVALID / BARCODE_EMPTY / BARCODE_TOO_LONG)
+    //   - barcode tak dikenal / siswa non-AKTIF / awalan barcode
+    //       ditahan service -> outcome dicatat catch(ScanRejectionException)
+    //       (BARCODE_NOT_FOUND / STUDENT_NOT_ACTIVE)
     // =================================================================
 
     public function test_valid_barcode_of_active_student_is_scanned(): void
@@ -320,6 +338,7 @@ class SchoolAttendanceScanTest extends TestCase
         $this->scan($teacherUser, 'TIDAKADA99', 'MASUK')->assertSessionHasErrors('barcode');
 
         $this->assertSame(0, SchoolAttendance::count());
+        // Audit outcome (BARCODE_NOT_FOUND) asserted centrally in section L.
     }
 
     public function test_non_active_student_barcode_is_rejected(): void
@@ -347,6 +366,7 @@ class SchoolAttendanceScanTest extends TestCase
         $this->scan($teacherUser, '', 'MASUK')->assertSessionHasErrors('barcode');
 
         $this->assertSame(0, SchoolAttendance::count());
+        // Outcome MODE_INVALID / BARCODE_EMPTY asserted centrally in section L.
     }
 
     public function test_overlong_barcode_is_rejected_before_lookup(): void
@@ -363,6 +383,8 @@ class SchoolAttendanceScanTest extends TestCase
             ->assertSessionHasErrors('barcode');
 
         $this->assertSame(0, SchoolAttendance::count());
+        // Outcome BARCODE_TOO_LONG (panajang) & BARCODE_NOT_FOUND (awalan)
+        // asserted centrally in section L.
     }
 
     // =================================================================

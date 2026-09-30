@@ -446,9 +446,12 @@ class AuthorizationTest extends TestCase
         $this->assertFalse(User::isValidRole('PIKET'));
     }
 
-    public function test_no_route_exists_for_scanner_yet(): void
+    public function test_scanner_has_only_the_two_suffixed_named_routes(): void
     {
-        // Prompt 25 TIDAK boleh membangun fitur scanner.
+        // Rute scanner yang sah adalah `...scanner.index` dan `...scanner.store`
+        // (dibangun pada eaddff9). Nama BARE 'guru.school-attendance-scanner'
+        // tidak boleh pernah terdaftar: adanya nama tanpa sufiks menandakan
+        // registrasi rute ganda/ambigu yang menabrak pipeline on.duty.
         $this->assertFalse(Route::has('guru.school-attendance-scanner'));
     }
 
