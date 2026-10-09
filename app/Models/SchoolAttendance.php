@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Support\Str;
 
 class SchoolAttendance extends Model
 {
@@ -26,6 +27,7 @@ class SchoolAttendance extends Model
      * @var array<int, string>
      */
     protected $fillable = [
+        'uuid',
         'student_id',
         'attendance_date',
         'check_in_time',
@@ -39,6 +41,29 @@ class SchoolAttendance extends Model
         'correction_reason',
         'corrected_at',
     ];
+
+    /**
+     * Boot: auto-generate UUID saat membuat record baru.
+     * UUID digunakan sebagai route key publik (anti-IDOR).
+     */
+    protected static function boot(): void
+    {
+        parent::boot();
+
+        static::creating(function (self $model) {
+            if (empty($model->uuid)) {
+                $model->uuid = Str::uuid()->toString();
+            }
+        });
+    }
+
+    /**
+     * Route model binding menggunakan UUID, bukan auto-increment ID.
+     */
+    public function getRouteKeyName(): string
+    {
+        return 'uuid';
+    }
 
     protected $casts = [
         'attendance_date' => 'date',

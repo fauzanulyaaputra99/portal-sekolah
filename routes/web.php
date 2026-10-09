@@ -6,6 +6,8 @@ use App\Http\Controllers\Auth\LoginController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\RoleDashboardController;
 use App\Http\Controllers\Teacher\SchoolAttendanceScanController;
+use App\Http\Controllers\Teacher\StudentAttendanceController;
+use App\Http\Controllers\Teacher\ProfileController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -117,6 +119,40 @@ Route::middleware(['auth', 'role:teacher'])
     ->name('guru.')
     ->group(function () {
         Route::get('/dashboard', [RoleDashboardController::class, 'guru'])->name('dashboard');
+
+        // -----------------------------------------------------------------
+        // Profil Guru (PRD 01 §7.2 GUR-PRF-001–002).
+        //
+        // Guru melihat biodata pribadi + riwayat penugasan mengajar,
+        // mengubah nomor kontak, dan mengganti kata sandi secara mandiri.
+        // -----------------------------------------------------------------
+        Route::get('/profile', [ProfileController::class, 'show'])->name('profile.show');
+        Route::get('/profile/edit', [ProfileController::class, 'edit'])->name('profile.edit');
+        Route::put('/profile/contact', [ProfileController::class, 'updateContact'])->name('profile.update-contact');
+        Route::get('/profile/password', [ProfileController::class, 'editPassword'])->name('profile.password');
+        Route::put('/profile/password', [ProfileController::class, 'updatePassword'])->name('profile.update-password');
+
+        // -----------------------------------------------------------------
+        // Absensi Siswa per Mata Pelajaran (PRD 01 §7.5 GUR-ATT-001–004).
+        //
+        // Guru membuka sesi absensi untuk kelas/mapel yang diampu, input
+        // kehadiran siswa (H/I/S/A), dan menutup sesi secara manual (ADR 14).
+        // - Anti-IDOR: StudentAttendanceSessionPolicy memastikan guru hanya
+        //   dapat mengakses sesi dari teaching_assignment miliknya sendiri.
+        // - Pre-fill HADIR: StudentAttendanceService otomatis membuat record
+        //   untuk seluruh siswa dengan status default HADIR (GUR-ATT-002).
+        // - Manual close: penutupan sesi dilakukan eksplisit oleh guru,
+        //   bukan otomatis (PRD 05 §5.11 ADR 14).
+        // -----------------------------------------------------------------
+        Route::resource('attendance', StudentAttendanceController::class)
+            ->only(['index', 'create', 'store', 'show', 'edit', 'update'])
+            ->parameters(['attendance' => 'session']);
+
+        Route::post('/attendance/{session}/close', [StudentAttendanceController::class, 'close'])
+            ->name('attendance.close');
+
+        Route::post('/attendance/{session}/reopen', [StudentAttendanceController::class, 'reopen'])
+            ->name('attendance.reopen');
 
         // -----------------------------------------------------------------
         // Scanner Absensi Masuk/Pulang Siswa (ADDENDUM §1–§21, PRD 01 §7.4).

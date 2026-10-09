@@ -33,23 +33,42 @@ const CAMERA_CONFIGS = [
     { video: true },
 ];
 
-const els = {
-    form: document.getElementById('scan-form'),
-    mode: document.getElementById('scan-mode'),
-    barcode: document.getElementById('scan-barcode'),
-    status: document.getElementById('camera-status'),
-    start: document.getElementById('camera-start'),
-    stop: document.getElementById('camera-stop'),
-    submit: document.getElementById('scan-submit'),
-};
+// Global scanner state untuk cleanup
+let globalScanner = null;
 
-// Halaman lain (mis. halaman terkunci 403) memakai layout yang sama tanpa
-// bagian scanner: tanpa elemen ini, skrip cukup diam.
-if (els.form && els.mode && els.barcode) {
-    initScanner();
-}
+// Turbo Drive compatibility: Initialize on every page load
+document.addEventListener('turbo:load', () => {
+    const els = {
+        form: document.getElementById('scan-form'),
+        mode: document.getElementById('scan-mode'),
+        barcode: document.getElementById('scan-barcode'),
+        status: document.getElementById('camera-status'),
+        start: document.getElementById('camera-start'),
+        stop: document.getElementById('camera-stop'),
+        submit: document.getElementById('scan-submit'),
+    };
 
-function initScanner() {
+    // Halaman lain (mis. halaman terkunci 403) memakai layout yang sama tanpa
+    // bagian scanner: tanpa elemen ini, skrip cukup diam.
+    if (els.form && els.mode && els.barcode) {
+        initScanner(els);
+    }
+});
+
+// Cleanup scanner before navigating away (Turbo Drive)
+document.addEventListener('turbo:before-cache', async () => {
+    if (globalScanner) {
+        try {
+            await globalScanner.stop();
+            await globalScanner.clear();
+        } catch (error) {
+            // Ignore cleanup errors
+        }
+        globalScanner = null;
+    }
+});
+
+function initScanner(els) {
     let lastDecode = { code: '', at: 0 };
     let submitting = false;
     let scanner = null;
@@ -125,6 +144,7 @@ function initScanner() {
     async function stopCamera() {
         if (!scanner || !running) {
             running = false;
+            globalScanner = null;
             return;
         }
 
@@ -142,6 +162,7 @@ function initScanner() {
 
         running = false;
         scanner = null;
+        globalScanner = null;
 
         if (els.start) {
             els.start.disabled = false;
@@ -206,6 +227,7 @@ function initScanner() {
                 );
 
                 scanner = instance;
+                globalScanner = instance;
                 running = true;
 
                 if (els.stop) {
@@ -259,10 +281,6 @@ function initScanner() {
         }
 
         submitting = true;
-        void stopCamera();
-    });
-
-    window.addEventListener('pagehide', () => {
         void stopCamera();
     });
 

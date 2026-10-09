@@ -597,8 +597,8 @@ class TeacherDutyScheduleTest extends TestCase
         // Tombol/aksi mutasi tidak dirender untuk supervisor (kenyamanan UI saja;
         // keamanan sesungguhnya tetap middleware + policy). Admin sebagai kontrol:
         // tombol dan URL aksi muncul penuh.
-        $editUrl = route('admin.duty-schedules.edit', $scheduleId);
-        $destroyUrl = route('admin.duty-schedules.destroy', $scheduleId);
+        $editUrl = route('admin.duty-schedules.edit', $schedule);
+        $destroyUrl = route('admin.duty-schedules.destroy', $schedule);
 
         $this->actingAs($this->adminControl($admin))->get(route('admin.duty-schedules.index'))
             ->assertOk()

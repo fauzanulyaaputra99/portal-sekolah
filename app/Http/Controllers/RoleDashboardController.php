@@ -24,35 +24,92 @@ class RoleDashboardController extends Controller
     {
         $user = $this->authorizeArea($request, User::ROLE_ADMIN);
 
-        return view('dashboards.role', [
+        return view('dashboards.admin', [
             'user' => $user,
-            'area' => 'Admin / Tata Usaha',
             'areaRoute' => 'admin.dashboard',
-            'role' => User::ROLE_ADMIN,
         ]);
     }
 
+    /**
+     * Dashboard Guru (PRD 01 §7.1 GUR-DASH-001–003).
+     *
+     * Widget:
+     * - GUR-DASH-001: Jadwal mengajar hari ini
+     * - GUR-DASH-002: Status Guru Piket hari ini + tombol scanner
+     * - GUR-DASH-003: Ringkasan status berkas ajar (placeholder — butuh A-03)
+     */
     public function guru(Request $request): View
     {
         $user = $this->authorizeArea($request, User::ROLE_TEACHER);
+        $teacher = $user->teacher;
 
-        return view('dashboards.role', [
+        // GUR-DASH-001: Jadwal mengajar hari ini
+        $todayDayOfWeek = now()->dayOfWeekIso;
+        $todaySchedules = collect();
+
+        if ($teacher) {
+            $todaySchedules = \App\Models\Schedule::query()
+                ->whereHas('teachingAssignment', fn ($q) => $q->where('teacher_id', $teacher->id))
+                ->where('day_of_week', $todayDayOfWeek)
+                ->with(['teachingAssignment.subject', 'teachingAssignment.classRoom.gradeLevel'])
+                ->orderBy('start_time')
+                ->get();
+        }
+
+        // GUR-DASH-002: Status Guru Piket hari ini
+        $isOnDutyToday = false;
+        if ($teacher) {
+            $isOnDutyToday = \App\Models\TeacherDutySchedule::query()
+                ->where('teacher_id', $teacher->id)
+                ->where('schedule_date', now()->toDateString())
+                ->exists();
+        }
+
+        // GUR-DASH-003: Ringkasan dokumen (placeholder — A-03 BLOCKED GoogleDriveService)
+        $documentSummary = null;
+
+        return view('dashboards.guru', [
             'user' => $user,
-            'area' => 'Guru',
-            'areaRoute' => 'guru.dashboard',
-            'role' => User::ROLE_TEACHER,
+            'teacher' => $teacher,
+            'todaySchedules' => $todaySchedules,
+            'isOnDutyToday' => $isOnDutyToday,
+            'documentSummary' => $documentSummary,
         ]);
     }
 
+    /**
+     * Dashboard Supervisor (PRD 01 §8.1 SUP-DASH-001–002).
+     *
+     * Widget:
+     * - SUP-DASH-001: Ringkasan progres pengumpulan dokumen seluruh guru
+     * - SUP-DASH-002: Antrean DIKIRIM/REVISI + distribusi status dokumen
+     *
+     * Catatan: Metrik nyata dokumen membutuhkan A-03 (GoogleDriveService).
+     * Saat ini menampilkan statistik guru dan placeholder dokumen.
+     */
     public function supervisor(Request $request): View
     {
         $user = $this->authorizeArea($request, User::ROLE_SUPERVISOR);
 
-        return view('dashboards.role', [
+        // Statistik guru (untuk monitoring kepatuhan)
+        $totalTeachers = \App\Models\Teacher::count();
+        $activeTeachers = \App\Models\Teacher::whereHas('user', fn ($q) => $q->where('is_active', true))->count();
+
+        // Placeholder metrik dokumen (A-03 BLOCKED GoogleDriveService)
+        // Nanti akan berisi: total dokumen per status, antrean review, distribusi kategori
+        $documentStats = [
+            'total' => 0,
+            'draft' => 0,
+            'submitted' => 0,
+            'approved' => 0,
+            'revision_requested' => 0,
+        ];
+
+        return view('dashboards.supervisor', [
             'user' => $user,
-            'area' => 'Atasan / Supervisor',
-            'areaRoute' => 'supervisor.dashboard',
-            'role' => User::ROLE_SUPERVISOR,
+            'totalTeachers' => $totalTeachers,
+            'activeTeachers' => $activeTeachers,
+            'documentStats' => $documentStats,
         ]);
     }
 
